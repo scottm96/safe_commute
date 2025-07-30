@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "521728664554",
+    "project_id": "safe-commute-cb13b",
+    "storage_bucket": "safe-commute-cb13b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:521728664554:android:3b64ab8dbaab23dadb4893",
+        "android_client_info": {
+          "package_name": "com.example.safe_commute"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyChoi0Vp9eyVmy6fiLKpn8-s25VN5gORvM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
