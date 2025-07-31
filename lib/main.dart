@@ -1,88 +1,43 @@
 import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'firebase_options.dart';
+import 'package:safe_commute/driver_screen.dart';
+import 'package:safe_commute/passenger_screen.dart';
 
-
-
-
-void main() async{
-  WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
-  runApp(const MyApp());
+void main() {
+  runApp(SafeCommuteApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class SafeCommuteApp extends StatelessWidget {
+  const SafeCommuteApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Firebase Init Test',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-      ),
-      home: const AuthCheckScreen(),
+      home: ModeSelectionScreen(),
     );
   }
 }
 
-class AuthCheckScreen extends StatefulWidget {
-  const AuthCheckScreen({super.key});
-
-  @override
-  State<AuthCheckScreen> createState() => _AuthCheckScreeenState();
-}
-
-class _AuthCheckScreeenState extends State<AuthCheckScreen> {
-  String _authStatus = 'Checking Firebase Authentication...';
-
-  @override
-  void initState() {
-    super.initState();
-    _performAnonymousLogin();
-  }
-
-  Future<void> _performAnonymousLogin() async {
-    try {
-      UserCredential userCredential = await FirebaseAuth.instance.signInAnonymously();
-      if (userCredential.user != null) {
-        setState(() {
-          _authStatus = 'Firebase initialized and Anonymous login successful! User ID: ${userCredential.user!.uid}';
-        });
-      } else {
-        setState(() {
-          _authStatus = 'Anonymous login failed: User is null.';
-        });
-      }
-    } on FirebaseAuthException catch (e) {
-      setState(() {
-        _authStatus = 'Firebase Auth Error: ${e.message}';
-      });
-    } catch (e) {
-      setState(() {
-        _authStatus = 'General Error during anonymous login: $e';
-      });
-    }
-  }
+class ModeSelectionScreen extends StatelessWidget {
+  const ModeSelectionScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Firebase Initialization Test'),
-      ),
+      appBar: AppBar(title: Text('SafeCommute')),
       body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Text(
-            _authStatus,
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 18),
-          ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            ElevatedButton(
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DriverScreen())), // Placeholder for navigation
+              child: Text('Driver Mode'),
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PassengerScreen())), // Placeholder for navigation
+              child: Text('Passenger Mode'),
+            ),
+          ],
         ),
       ),
     );
