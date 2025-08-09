@@ -74,16 +74,20 @@ class _DriverScreenState extends State<DriverScreen> {
 }*/
 
 import 'dart:async';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:vibration/vibration.dart';
 import 'package:flutter/foundation.dart' show WriteBuffer;
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
 
+
 class DriverScreen extends StatefulWidget {
   const DriverScreen({super.key});
 
   @override
-  _DriverScreenState createState() => _DriverScreenState();
+  State<DriverScreen> createState() => _DriverScreenState();
+
 }
 
 class _DriverScreenState extends State<DriverScreen> {
@@ -211,12 +215,102 @@ class _DriverScreenState extends State<DriverScreen> {
       debugPrint("Error in processing image: $e");
     }
   }
+final AudioPlayer _audioPlayer = AudioPlayer();
+Timer? _alertEscalationTimer;
+Timer? _autoStopTimer;
 
-  void _triggerDrowsinessAlert() {
-    _alertTriggered = true;
-    debugPrint("⚠ ALERT: Possible Drowsiness Detected!");
-    // TODO: Add sound, vibration, or UI alert here
+void _triggerDrowsinessAlert() async {
+  if (_alertTriggered) return; // Prevent duplicate alerts
+  _alertTriggered = true;
+  debugPrint("⚠ Gentle Alert: Possible Drowsiness Detected!");
+
+  // Stage 1: Gentle sound & short vibration
+  await _audioPlayer.play(AssetSource('sounds/soft_beep.mp3'), volume: 0.5);
+  if (await Vibration.hasVibrator() ?? false) {
+    Vibration.vibrate(pattern: [0, 300, 150, 300]);
   }
+
+  // Show a friendly overlay instead of blocking UI
+  if (mounted) {
+    _showGentleOverlay();
+  }
+
+  // Stage 2: Escalate after 5 seconds if no acknowledgment
+  _alertEscalationTimer = Timer(const Duration(seconds: 5), () async {
+    if (_alertTriggered) {
+      debugPrint("⚠ Escalating Alert: Still no acknowledgment.");
+      await _audioPlayer.play(AssetSource('sounds/alarm.mp3'), volume: 1.0);
+      if (await Vibration.hasVibrator() ?? false) {
+        Vibration.vibrate(pattern: [0, 600, 200, 600, 200, 600]);
+      }
+      _showEscalatedOverlay();
+    }
+  });
+
+  // Auto-stop after 15 seconds max
+  _autoStopTimer = Timer(const Duration(seconds: 15), () {
+    if (_alertTriggered) {
+      _stopAlert();
+    }
+  });
+}
+
+void _stopAlert() {
+  _audioPlayer.stop();
+  Vibration.cancel();
+  _alertTriggered = false;
+  _alertEscalationTimer?.cancel();
+  _autoStopTimer?.cancel();
+  if (mounted) {
+    Navigator.of(context, rootNavigator: true).pop(); // Close overlay if open
+  }
+}
+
+void _showGentleOverlay() {
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    barrierColor: Colors.black.withValues(alpha: 0.3),
+    builder: (ctx) {
+      return AlertDialog(
+        title: const Text("Stay Alert"),
+        content: const Text("It seems like you may be feeling drowsy. Please take a break."),
+        actions: [
+          TextButton(
+            onPressed: _stopAlert,
+            child: const Text("I'm Okay"),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+void _showEscalatedOverlay() {
+  if (mounted) {
+    Navigator.of(context, rootNavigator: true).pop(); // Close gentle overlay
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withValues(alpha: 0.6),
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text(
+            "⚠ Warning",
+            style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+          ),
+          content: const Text("Please pull over safely and rest before continuing."),
+          actions: [
+            TextButton(
+              onPressed: _stopAlert,
+              child: const Text("I Understand"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
 
   @override
   void dispose() {

@@ -32,6 +32,10 @@ dependencies:
     sdk: flutter
   camera: ^0.10.0
   google_ml_kit: ^0.13.0
+  audioplayers: ^6.5.0
+  vibration: ^1.8.4
+  
+
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
@@ -60,6 +64,9 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+  assets: 
+      - assets/sounds/beep.wav
+      - assets/sounds/alarm.wav
 
   # To add assets to your application, add an assets section, like this:
   # assets:
