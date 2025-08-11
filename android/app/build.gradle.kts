@@ -8,10 +8,19 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+extra["kotlin_version"] = "1.9.24"
+
 android {
     namespace = "com.example.safe_commute"
-    compileSdk = 35
-    ndkVersion = flutter.ndkVersion
+    compileSdk = 36  // Required for camera plugin
+    defaultConfig {
+        targetSdk = 36 
+        minSdk = 23
+        ndkVersion = "27.1.12297006"
+        applicationId = "com.example.safe_commute"
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -20,17 +29,6 @@ android {
 
     kotlinOptions {
         jvmTarget = JavaVersion.VERSION_11.toString()
-    }
-
-    defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.safe_commute"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = 21
-        targetSdk = 35
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
     }
 
     buildTypes {
