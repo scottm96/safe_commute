@@ -2,8 +2,9 @@ import 'dart:async';
 import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:vibration/vibration.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show WriteBuffer;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
@@ -19,14 +20,14 @@ class _DriverScreenState extends State<DriverScreen> {
   List<CameraDescription>? cameras;
   late FaceDetector _faceDetector;
   bool _isDetecting = false;
+  Timer? _eyeClosureTimer;
   int _closedEyeFrames = 0;
   bool _alertTriggered = false;
   final AudioPlayer _audioPlayer = AudioPlayer();
   Timer? _alertEscalationTimer;
   Timer? _autoStopTimer;
 
-  // Android orientation mapping
-  final Map<DeviceOrientation, int> _orientations = {
+  final _orientations = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
     DeviceOrientation.portraitDown: 180,
@@ -45,7 +46,7 @@ class _DriverScreenState extends State<DriverScreen> {
       enableClassification: true,
       enableLandmarks: true,
       enableContours: true,
-      performanceMode: FaceDetectorMode.accurate,
+      performanceMode: FaceDetectorMode.fast, // CHANGED: Set to fast mode for better performance
     );
     _faceDetector = FaceDetector(options: options);
   }
@@ -64,7 +65,7 @@ class _DriverScreenState extends State<DriverScreen> {
 
       _controller = CameraController(
         frontCamera,
-        ResolutionPreset.medium,
+        ResolutionPreset.low, // CHANGED: Set to low resolution for performance
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
       await _controller!.initialize();
@@ -82,7 +83,10 @@ class _DriverScreenState extends State<DriverScreen> {
       return;
     }
 
-    _isDetecting = false; // Reset to allow detection
+    // `_isDetecting` is now also checked on the button's `onPressed` property.
+    if (_isDetecting) return;
+    _isDetecting = true;
+
     _controller!.startImageStream((CameraImage image) {
       if (_isDetecting) return;
       _isDetecting = true;
@@ -90,20 +94,31 @@ class _DriverScreenState extends State<DriverScreen> {
         _isDetecting = false;
       });
     });
+
+    // Update the UI to disable the button
+    setState(() {});
   }
 
   void _stopDetection() {
     _controller?.stopImageStream();
     _closedEyeFrames = 0;
     _alertTriggered = false;
+    _eyeClosureTimer?.cancel();
     _stopAlert();
+
+    // Update the state and UI when detection stops
+    _isDetecting = false;
+    setState(() {});
   }
 
   Future<void> _processCameraImage(CameraImage image) async {
-    try {
-      final inputImage = _getInputImageFromCameraImage(image, _controller!);
-      if (inputImage == null) return;
+    final inputImage = _getInputImageFromCameraImage(image, _controller!);
+    if (inputImage == null) {
+      debugPrint("❌ Failed to get a valid InputImage.");
+      return;
+    }
 
+    try {
       final faces = await _faceDetector.processImage(inputImage);
       if (faces.isNotEmpty) {
         final face = faces.first;
@@ -121,7 +136,7 @@ class _DriverScreenState extends State<DriverScreen> {
           }
         }
       } else {
-        _closedEyeFrames = 0; // Reset if no face detected
+        _closedEyeFrames = 0;
       }
     } catch (e) {
       debugPrint("Error processing image: $e");
@@ -132,14 +147,17 @@ class _DriverScreenState extends State<DriverScreen> {
     CameraImage image,
     CameraController controller,
   ) {
+    debugPrint('🔄 [CONVERT] Starting image conversion...');
     try {
       final camera = controller.description;
       final sensorOrientation = camera.sensorOrientation;
-      final isIOS = Platform.isIOS;
+      debugPrint('🔄 [CONVERT] Camera sensor orientation: $sensorOrientation');
+      debugPrint('🔄 [CONVERT] Platform: ${Platform.isIOS ? "iOS" : "Android"}');
 
-      // --- Determine rotation ---
       InputImageRotation? rotation;
-      if (isIOS) {
+
+      if (Platform.isIOS) {
+        debugPrint('📱 [CONVERT] iOS device detected');
         switch (controller.value.deviceOrientation) {
           case DeviceOrientation.portraitUp:
             rotation = camera.lensDirection == CameraLensDirection.front
@@ -162,72 +180,131 @@ class _DriverScreenState extends State<DriverScreen> {
                 : InputImageRotation.rotation180deg;
             break;
         }
-      } else {
-        var rotationComp = _orientations[controller.value.deviceOrientation];
-        if (rotationComp == null) return null;
+        debugPrint('📱 [CONVERT] iOS rotation set to: $rotation');
+      } else if (Platform.isAndroid) {
+        debugPrint('🤖 [CONVERT] Android device detected');
+        var rotationCompensation =
+            _orientations[controller.value.deviceOrientation];
+        debugPrint('🔄 [CONVERT] Device orientation: ${controller.value.deviceOrientation}');
+        debugPrint('🔄 [CONVERT] Rotation compensation: $rotationCompensation');
 
-        rotationComp = camera.lensDirection == CameraLensDirection.front
-            ? (sensorOrientation + rotationComp) % 360
-            : (sensorOrientation - rotationComp + 360) % 360;
+        if (rotationCompensation == null) {
+          debugPrint('❌ [CONVERT] No rotation compensation found');
+          return null;
+        }
 
-        rotation = InputImageRotationValue.fromRawValue(rotationComp);
+        if (camera.lensDirection == CameraLensDirection.front) {
+          debugPrint('📷 [CONVERT] Front-facing camera');
+          rotationCompensation =
+              (sensorOrientation + rotationCompensation) % 360;
+        } else {
+          debugPrint('📷 [CONVERT] Back-facing camera');
+          rotationCompensation =
+              (sensorOrientation - rotationCompensation + 360) % 360;
+        }
+        debugPrint('🔄 [CONVERT] Final rotation compensation: $rotationCompensation');
+        rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
       }
-      if (rotation == null) return null;
 
-      // --- Validate format ---
+      if (rotation == null) {
+        debugPrint('❌ [CONVERT] Failed to determine rotation');
+        return null;
+      }
+      debugPrint('✅ [CONVERT] Rotation determined: $rotation');
+
+      debugPrint('🔄 [CONVERT] Image format raw value: ${image.format.raw}');
       final format = InputImageFormatValue.fromRawValue(image.format.raw);
-      if (format == null) return null;
+      debugPrint('🔄 [CONVERT] Converted format: $format');
 
-      if (isIOS && format != InputImageFormat.bgra8888) return null;
-      if (!isIOS &&
-          format != InputImageFormat.nv21 &&
-          format != InputImageFormat.yuv420 &&
-          format != InputImageFormat.yuv_420_888) {
+      if (format == null) {
+        debugPrint('❌ [CONVERT] Unsupported image format: ${image.format.raw}');
         return null;
       }
 
-      // --- Plane validation ---
-      if (isIOS && image.planes.length != 1) return null;
-      if (!isIOS) {
-        if (format == InputImageFormat.nv21 && image.planes.length != 1) {
+      if (Platform.isIOS) {
+        if (format != InputImageFormat.bgra8888) {
+          debugPrint('❌ [CONVERT] iOS: Expected bgra8888 format, got $format');
           return null;
         }
-        if ((format == InputImageFormat.yuv420 ||
-                format == InputImageFormat.yuv_420_888) &&
-            image.planes.isEmpty) {
+        debugPrint('✅ [CONVERT] iOS: BGRA8888 format validated');
+      } else {
+        if (format != InputImageFormat.nv21 &&
+            format != InputImageFormat.yuv420 &&
+            format != InputImageFormat.yuv_420_888) {
+          debugPrint(
+            '❌ [CONVERT] Android: Expected nv21, yuv420, or yuv_420_888 format, got $format',
+          );
           return null;
+        }
+        debugPrint('✅ [CONVERT] Android: Format validation passed');
+      }
+
+      if (Platform.isIOS) {
+        if (image.planes.length != 1) {
+          debugPrint('❌ [CONVERT] iOS expected 1 plane, got ${image.planes.length}');
+          return null;
+        }
+        debugPrint('✅ [CONVERT] iOS: Single plane validated');
+      } else {
+        if (format == InputImageFormat.nv21) {
+          if (image.planes.length != 1) {
+            debugPrint('❌ [CONVERT] NV21 expected 1 plane, got ${image.planes.length}');
+            return null;
+          }
+        } else if (format == InputImageFormat.yuv420 ||
+            format == InputImageFormat.yuv_420_888) {
+          if (image.planes.isEmpty) {
+            debugPrint('❌ [CONVERT] YUV420/YUV_420_888 has no planes');
+            return null;
+          }
+          debugPrint('🔄 [CONVERT] YUV420/YUV_420_888 has ${image.planes.length} planes, using first plane');
         }
       }
 
-      // --- Convert if needed ---
+      final plane = image.planes.first;
+      debugPrint('🔄 [CONVERT] Plane bytes length: ${plane.bytes.length}');
+      debugPrint('🔄 [CONVERT] Plane bytes per row: ${plane.bytesPerRow}');
+
       Uint8List bytes;
       InputImageFormat finalFormat = format;
-      if (!isIOS &&
+
+      if (Platform.isAndroid &&
           (format == InputImageFormat.yuv420 ||
               format == InputImageFormat.yuv_420_888) &&
           image.planes.length >= 3) {
+        debugPrint('🔄 [CONVERT] Converting YUV_420_888 to NV21...');
         bytes = _convertYUV420ToNV21(image);
         finalFormat = InputImageFormat.nv21;
+        debugPrint('🔄 [CONVERT] Converted bytes length: ${bytes.length}');
       } else {
-        bytes = image.planes.first.bytes;
+        final WriteBuffer allBytes = WriteBuffer();
+        for (final plane in image.planes) {
+          allBytes.putUint8List(plane.bytes);
+        }
+        bytes = allBytes.done().buffer.asUint8List();
       }
 
-      return InputImage.fromBytes(
+      final inputImage = InputImage.fromBytes(
         bytes: bytes,
         metadata: InputImageMetadata(
           size: Size(image.width.toDouble(), image.height.toDouble()),
           rotation: rotation,
           format: finalFormat,
-          bytesPerRow: image.planes.first.bytesPerRow,
+          bytesPerRow: plane.bytesPerRow,
         ),
       );
+
+      debugPrint('✅ [CONVERT] InputImage created successfully');
+      return inputImage;
     } catch (e) {
-      debugPrint('Error converting camera image: $e');
+      debugPrint('❌ [CONVERT] Error converting camera image: $e');
+      debugPrint('❌ [CONVERT] Stack trace: ${StackTrace.current}');
       return null;
     }
   }
 
   Uint8List _convertYUV420ToNV21(CameraImage image) {
+    debugPrint('🔄 [YUV] Converting YUV420 to NV21...');
     final int width = image.width;
     final int height = image.height;
     final int ySize = width * height;
@@ -235,10 +312,11 @@ class _DriverScreenState extends State<DriverScreen> {
 
     final Uint8List nv21 = Uint8List(ySize + uvSize * 2);
 
-    // Copy Y plane
     final Uint8List yPlane = image.planes[0].bytes;
     final int yRowStride = image.planes[0].bytesPerRow;
     final int yPixelStride = image.planes[0].bytesPerPixel ?? 1;
+
+    debugPrint('🔄 [YUV] Y plane - size: ${yPlane.length}, rowStride: $yRowStride, pixelStride: $yPixelStride');
 
     for (int y = 0; y < height; y++) {
       for (int x = 0; x < width; x++) {
@@ -246,13 +324,15 @@ class _DriverScreenState extends State<DriverScreen> {
       }
     }
 
-    // Copy UV planes
     final Uint8List uPlane = image.planes[1].bytes;
     final Uint8List vPlane = image.planes[2].bytes;
     final int uRowStride = image.planes[1].bytesPerRow;
     final int vRowStride = image.planes[2].bytesPerRow;
     final int uPixelStride = image.planes[1].bytesPerPixel ?? 1;
     final int vPixelStride = image.planes[2].bytesPerPixel ?? 1;
+
+    debugPrint('🔄 [YUV] U plane - size: ${uPlane.length}, rowStride: $uRowStride, pixelStride: $uPixelStride');
+    debugPrint('🔄 [YUV] V plane - size: ${vPlane.length}, rowStride: $vRowStride, pixelStride: $vPixelStride');
 
     int uvIndex = ySize;
     for (int y = 0; y < height ~/ 2; y++) {
@@ -270,6 +350,7 @@ class _DriverScreenState extends State<DriverScreen> {
       }
     }
 
+    debugPrint('✅ [YUV] YUV420 to NV21 conversion complete');
     return nv21;
   }
 
@@ -280,7 +361,7 @@ class _DriverScreenState extends State<DriverScreen> {
 
     try {
       await _audioPlayer.play(AssetSource('sounds/beep.wav'), volume: 0.5);
-      if (await Vibration.hasVibrator()) {
+      if (await Vibration.hasVibrator() ?? false) {
         Vibration.vibrate(pattern: [0, 300, 150, 300]);
       }
     } catch (e) {
@@ -296,7 +377,7 @@ class _DriverScreenState extends State<DriverScreen> {
         debugPrint("⚠ Escalating Alert: Still no acknowledgment.");
         try {
           await _audioPlayer.play(AssetSource('sounds/alarm.wav'), volume: 1.0);
-          if (await Vibration.hasVibrator()) {
+          if (await Vibration.hasVibrator() ?? false) {
             Vibration.vibrate(pattern: [0, 600, 200, 600, 200, 600]);
           }
         } catch (e) {
@@ -329,7 +410,7 @@ class _DriverScreenState extends State<DriverScreen> {
       showDialog(
         context: context,
         barrierDismissible: false,
-        barrierColor: Colors.black.withValues(alpha: 0.3),
+        barrierColor: Colors.black.withOpacity(0.3),
         builder: (ctx) {
           return AlertDialog(
             title: const Text("Stay Alert"),
@@ -353,7 +434,7 @@ class _DriverScreenState extends State<DriverScreen> {
       showDialog(
         context: context,
         barrierDismissible: false,
-        barrierColor: Colors.black.withValues(alpha: 0.3),
+        barrierColor: Colors.black.withOpacity(0.6),
         builder: (ctx) {
           return AlertDialog(
             title: const Text(
@@ -379,6 +460,7 @@ class _DriverScreenState extends State<DriverScreen> {
     _controller?.stopImageStream();
     _controller?.dispose();
     _faceDetector.close();
+    _eyeClosureTimer?.cancel();
     _alertEscalationTimer?.cancel();
     _autoStopTimer?.cancel();
     _audioPlayer.dispose();
@@ -405,7 +487,8 @@ class _DriverScreenState extends State<DriverScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 ElevatedButton(
-                  onPressed: _startDetection,
+                  // FIXED: The onPressed callback is now null when `_isDetecting` is true
+                  onPressed: _isDetecting ? null : _startDetection,
                   child: const Text('Start Detection'),
                 ),
                 const SizedBox(width: 20),
