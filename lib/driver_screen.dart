@@ -15,11 +15,12 @@ class DriverScreen extends StatefulWidget {
   State<DriverScreen> createState() => _DriverScreenState();
 }
 
-class _DriverScreenState extends State<DriverScreen> {
+class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver {
   CameraController? _controller;
   List<CameraDescription>? cameras;
   late FaceDetector _faceDetector;
   bool _isDetecting = false;
+  bool _isStreamingImages = false; // Track if image stream is active
   Timer? _eyeClosureTimer;
   int _closedEyeFrames = 0;
   bool _alertTriggered = false;
@@ -37,8 +38,26 @@ class _DriverScreenState extends State<DriverScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initializeFaceDetector();
     _initializeCamera();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller == null || !_controller!.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      // App is going to background or being closed
+      _stopDetection();
+    } else if (state == AppLifecycleState.resumed) {
+      // App is coming back to foreground
+      // Optionally restart detection if it was running before
+    }
   }
 
   void _initializeFaceDetector() {
@@ -46,7 +65,7 @@ class _DriverScreenState extends State<DriverScreen> {
       enableClassification: true,
       enableLandmarks: true,
       enableContours: true,
-      performanceMode: FaceDetectorMode.fast, // CHANGED: Set to fast mode for better performance
+      performanceMode: FaceDetectorMode.fast,
     );
     _faceDetector = FaceDetector(options: options);
   }
@@ -65,7 +84,7 @@ class _DriverScreenState extends State<DriverScreen> {
 
       _controller = CameraController(
         frontCamera,
-        ResolutionPreset.low, // CHANGED: Set to low resolution for performance
+        ResolutionPreset.low,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
       await _controller!.initialize();
@@ -83,32 +102,73 @@ class _DriverScreenState extends State<DriverScreen> {
       return;
     }
 
-    // `_isDetecting` is now also checked on the button's `onPressed` property.
-    if (_isDetecting) return;
+    if (_isDetecting || _isStreamingImages) {
+      debugPrint("Detection already running or image stream active");
+      return;
+    }
+
     _isDetecting = true;
+    _isStreamingImages = true;
 
-    _controller!.startImageStream((CameraImage image) {
-      if (_isDetecting) return;
-      _isDetecting = true;
-      _processCameraImage(image).then((_) {
-        _isDetecting = false;
+    try {
+      _controller!.startImageStream((CameraImage image) {
+        if (!_isDetecting) return;
+        
+        // Use a flag to prevent multiple simultaneous processing
+        if (_isDetecting) {
+          _isDetecting = false;
+          _processCameraImage(image).then((_) {
+            _isDetecting = true;
+          }).catchError((error) {
+            debugPrint("Error processing image: $error");
+            _isDetecting = true;
+          });
+        }
       });
-    });
+    } catch (e) {
+      debugPrint("Error starting image stream: $e");
+      _isDetecting = false;
+      _isStreamingImages = false;
+    }
 
-    // Update the UI to disable the button
-    setState(() {});
+    // Update the UI
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _stopDetection() {
-    _controller?.stopImageStream();
+    debugPrint("Stopping detection...");
+    
+    // Stop processing first
+    _isDetecting = false;
+    
+    // Reset detection state
     _closedEyeFrames = 0;
     _alertTriggered = false;
     _eyeClosureTimer?.cancel();
     _stopAlert();
 
-    // Update the state and UI when detection stops
-    _isDetecting = false;
-    setState(() {});
+    // Stop image stream only if it's active and controller is available
+    if (_isStreamingImages && 
+        _controller != null && 
+        _controller!.value.isInitialized &&
+        _controller!.value.isStreamingImages) {
+      try {
+        _controller!.stopImageStream();
+        debugPrint("Image stream stopped successfully");
+      } catch (e) {
+        debugPrint("Error stopping image stream: $e");
+        // Don't rethrow the error, just log it
+      }
+    }
+    
+    _isStreamingImages = false;
+
+    // Update the UI
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _processCameraImage(CameraImage image) async {
@@ -357,7 +417,7 @@ class _DriverScreenState extends State<DriverScreen> {
   void _triggerDrowsinessAlert() async {
     if (_alertTriggered) return;
     _alertTriggered = true;
-    debugPrint("⚠ Gentle Alert: Possible Drowsiness Detected!");
+    debugPrint("⚠️ Gentle Alert: Possible Drowsiness Detected!");
 
     try {
       await _audioPlayer.play(AssetSource('sounds/beep.wav'), volume: 0.5);
@@ -374,7 +434,7 @@ class _DriverScreenState extends State<DriverScreen> {
 
     _alertEscalationTimer = Timer(const Duration(seconds: 5), () async {
       if (_alertTriggered && mounted) {
-        debugPrint("⚠ Escalating Alert: Still no acknowledgment.");
+        debugPrint("⚠️ Escalating Alert: Still no acknowledgment.");
         try {
           await _audioPlayer.play(AssetSource('sounds/alarm.wav'), volume: 1.0);
           if (await Vibration.hasVibrator() ?? false) {
@@ -400,7 +460,7 @@ class _DriverScreenState extends State<DriverScreen> {
     _alertTriggered = false;
     _alertEscalationTimer?.cancel();
     _autoStopTimer?.cancel();
-    if (mounted) {
+    if (mounted && Navigator.canPop(context)) {
       Navigator.of(context, rootNavigator: true).pop();
     }
   }
@@ -429,8 +489,10 @@ class _DriverScreenState extends State<DriverScreen> {
   }
 
   void _showEscalatedOverlay() {
-    if (mounted) {
+    if (mounted && Navigator.canPop(context)) {
       Navigator.of(context, rootNavigator: true).pop();
+    }
+    if (mounted) {
       showDialog(
         context: context,
         barrierDismissible: false,
@@ -438,7 +500,7 @@ class _DriverScreenState extends State<DriverScreen> {
         builder: (ctx) {
           return AlertDialog(
             title: const Text(
-              "⚠ Warning",
+              "⚠️ Warning",
               style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
             ),
             content: const Text(
@@ -457,13 +519,27 @@ class _DriverScreenState extends State<DriverScreen> {
 
   @override
   void dispose() {
-    _controller?.stopImageStream();
-    _controller?.dispose();
-    _faceDetector.close();
+    WidgetsBinding.instance.removeObserver(this);
+    
+    // Stop detection first
+    _stopDetection();
+    
+    // Clean up timers
     _eyeClosureTimer?.cancel();
     _alertEscalationTimer?.cancel();
     _autoStopTimer?.cancel();
+    
+    // Clean up audio
     _audioPlayer.dispose();
+    
+    // Clean up face detector
+    _faceDetector.close();
+    
+    // Clean up camera controller
+    if (_controller != null) {
+      _controller!.dispose();
+    }
+    
     super.dispose();
   }
 
@@ -487,13 +563,12 @@ class _DriverScreenState extends State<DriverScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 ElevatedButton(
-                  // FIXED: The onPressed callback is now null when `_isDetecting` is true
-                  onPressed: _isDetecting ? null : _startDetection,
-                  child: const Text('Start Detection'),
+                  onPressed: (!_isDetecting && !_isStreamingImages) ? _startDetection : null,
+                  child: Text(_isStreamingImages ? 'Detection Running...' : 'Start Detection'),
                 ),
                 const SizedBox(width: 20),
                 ElevatedButton(
-                  onPressed: _stopDetection,
+                  onPressed: _isStreamingImages ? _stopDetection : null,
                   child: const Text('Stop Detection'),
                 ),
               ],
