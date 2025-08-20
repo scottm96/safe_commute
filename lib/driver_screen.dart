@@ -2,11 +2,15 @@ import 'dart:async';
 import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:vibration/vibration.dart';
-import 'package:flutter/foundation.dart' show WriteBuffer;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:provider/provider.dart';
+import 'package:geolocator/geolocator.dart';
+import 'auth_service.dart';
+import 'monitoring_service.dart';
+import 'location_service.dart';
 
 class DriverScreen extends StatefulWidget {
   const DriverScreen({super.key});
@@ -15,18 +19,20 @@ class DriverScreen extends StatefulWidget {
   State<DriverScreen> createState() => _DriverScreenState();
 }
 
-class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver {
+class _DriverScreenState extends State<DriverScreen>
+    with WidgetsBindingObserver {
   CameraController? _controller;
   List<CameraDescription>? cameras;
   late FaceDetector _faceDetector;
   bool _isDetecting = false;
-  bool _isStreamingImages = false; // Track if image stream is active
+  bool _isStreamingImages = false;
   Timer? _eyeClosureTimer;
   int _closedEyeFrames = 0;
   bool _alertTriggered = false;
   final AudioPlayer _audioPlayer = AudioPlayer();
   Timer? _alertEscalationTimer;
   Timer? _autoStopTimer;
+  Timer? _locationUpdateTimer;
 
   final _orientations = {
     DeviceOrientation.portraitUp: 0,
@@ -41,6 +47,7 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     WidgetsBinding.instance.addObserver(this);
     _initializeFaceDetector();
     _initializeCamera();
+    _startLocationTracking();
   }
 
   @override
@@ -52,10 +59,8 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
-      // App is going to background or being closed
       _stopDetection();
     } else if (state == AppLifecycleState.resumed) {
-      // App is coming back to foreground
       // Optionally restart detection if it was running before
     }
   }
@@ -96,6 +101,39 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     }
   }
 
+  void _startLocationTracking() async {
+    final locationService = context.read<LocationService>();
+    final monitoringService = context.read<MonitoringService>();
+    final auth = context.read<AuthService>();
+
+    if (auth.currentUser != null) {
+      // Start monitoring service
+      await monitoringService.startDriverMonitoring(
+        auth.currentUser!.id,
+        auth.currentUser!.busNumber ?? 'Unknown',
+      );
+
+      // Start location tracking
+      await locationService.startLocationTracking(
+        onLocationUpdate: (Position position) {
+          // Update location in monitoring service
+          monitoringService.updateDriverLocation(
+              auth.currentUser!.id, position);
+        },
+      );
+
+      // Start periodic location updates
+      _locationUpdateTimer =
+          Timer.periodic(const Duration(seconds: 30), (timer) async {
+        final position = await locationService.getCurrentLocation();
+        if (position != null) {
+          monitoringService.updateDriverLocation(
+              auth.currentUser!.id, position);
+        }
+      });
+    }
+  }
+
   void _startDetection() {
     if (_controller == null || !_controller!.value.isInitialized) {
       debugPrint("Camera not initialized");
@@ -113,8 +151,7 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     try {
       _controller!.startImageStream((CameraImage image) {
         if (!_isDetecting) return;
-        
-        // Use a flag to prevent multiple simultaneous processing
+
         if (_isDetecting) {
           _isDetecting = false;
           _processCameraImage(image).then((_) {
@@ -131,7 +168,6 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
       _isStreamingImages = false;
     }
 
-    // Update the UI
     if (mounted) {
       setState(() {});
     }
@@ -139,19 +175,15 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
 
   void _stopDetection() {
     debugPrint("Stopping detection...");
-    
-    // Stop processing first
+
     _isDetecting = false;
-    
-    // Reset detection state
     _closedEyeFrames = 0;
     _alertTriggered = false;
     _eyeClosureTimer?.cancel();
     _stopAlert();
 
-    // Stop image stream only if it's active and controller is available
-    if (_isStreamingImages && 
-        _controller != null && 
+    if (_isStreamingImages &&
+        _controller != null &&
         _controller!.value.isInitialized &&
         _controller!.value.isStreamingImages) {
       try {
@@ -159,13 +191,11 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
         debugPrint("Image stream stopped successfully");
       } catch (e) {
         debugPrint("Error stopping image stream: $e");
-        // Don't rethrow the error, just log it
       }
     }
-    
+
     _isStreamingImages = false;
 
-    // Update the UI
     if (mounted) {
       setState(() {});
     }
@@ -174,7 +204,7 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
   Future<void> _processCameraImage(CameraImage image) async {
     final inputImage = _getInputImageFromCameraImage(image, _controller!);
     if (inputImage == null) {
-      debugPrint("❌ Failed to get a valid InputImage.");
+      debugPrint("Failed to get a valid InputImage.");
       return;
     }
 
@@ -186,13 +216,27 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
             face.rightEyeOpenProbability != null) {
           final leftEyeOpen = face.leftEyeOpenProbability!;
           final rightEyeOpen = face.rightEyeOpenProbability!;
-          if (leftEyeOpen < 0.3 && rightEyeOpen < 0.3) {
+
+          bool isDrowsy = leftEyeOpen < 0.3 && rightEyeOpen < 0.3;
+
+          if (isDrowsy) {
             _closedEyeFrames++;
             if (_closedEyeFrames > 15 && !_alertTriggered) {
               _triggerDrowsinessAlert();
             }
           } else {
             _closedEyeFrames = 0;
+          }
+
+          // Update monitoring service
+          final auth = context.read<AuthService>();
+          final monitoringService = context.read<MonitoringService>();
+          if (auth.currentUser != null) {
+            monitoringService.updateDrowsinessStatus(
+              auth.currentUser!.id,
+              isDrowsy,
+              _closedEyeFrames,
+            );
           }
         }
       } else {
@@ -203,21 +247,19 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     }
   }
 
+  // [Include the same image processing methods from the original file]
   InputImage? _getInputImageFromCameraImage(
     CameraImage image,
     CameraController controller,
   ) {
-    debugPrint('🔄 [CONVERT] Starting image conversion...');
+    debugPrint('Starting image conversion...');
     try {
       final camera = controller.description;
       final sensorOrientation = camera.sensorOrientation;
-      debugPrint('🔄 [CONVERT] Camera sensor orientation: $sensorOrientation');
-      debugPrint('🔄 [CONVERT] Platform: ${Platform.isIOS ? "iOS" : "Android"}');
 
       InputImageRotation? rotation;
 
       if (Platform.isIOS) {
-        debugPrint('📱 [CONVERT] iOS device detected');
         switch (controller.value.deviceOrientation) {
           case DeviceOrientation.portraitUp:
             rotation = camera.lensDirection == CameraLensDirection.front
@@ -240,91 +282,35 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
                 : InputImageRotation.rotation180deg;
             break;
         }
-        debugPrint('📱 [CONVERT] iOS rotation set to: $rotation');
       } else if (Platform.isAndroid) {
-        debugPrint('🤖 [CONVERT] Android device detected');
         var rotationCompensation =
             _orientations[controller.value.deviceOrientation];
-        debugPrint('🔄 [CONVERT] Device orientation: ${controller.value.deviceOrientation}');
-        debugPrint('🔄 [CONVERT] Rotation compensation: $rotationCompensation');
-
-        if (rotationCompensation == null) {
-          debugPrint('❌ [CONVERT] No rotation compensation found');
-          return null;
-        }
+        if (rotationCompensation == null) return null;
 
         if (camera.lensDirection == CameraLensDirection.front) {
-          debugPrint('📷 [CONVERT] Front-facing camera');
           rotationCompensation =
               (sensorOrientation + rotationCompensation) % 360;
         } else {
-          debugPrint('📷 [CONVERT] Back-facing camera');
           rotationCompensation =
               (sensorOrientation - rotationCompensation + 360) % 360;
         }
-        debugPrint('🔄 [CONVERT] Final rotation compensation: $rotationCompensation');
         rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
       }
 
-      if (rotation == null) {
-        debugPrint('❌ [CONVERT] Failed to determine rotation');
-        return null;
-      }
-      debugPrint('✅ [CONVERT] Rotation determined: $rotation');
+      if (rotation == null) return null;
 
-      debugPrint('🔄 [CONVERT] Image format raw value: ${image.format.raw}');
       final format = InputImageFormatValue.fromRawValue(image.format.raw);
-      debugPrint('🔄 [CONVERT] Converted format: $format');
-
-      if (format == null) {
-        debugPrint('❌ [CONVERT] Unsupported image format: ${image.format.raw}');
-        return null;
-      }
+      if (format == null) return null;
 
       if (Platform.isIOS) {
-        if (format != InputImageFormat.bgra8888) {
-          debugPrint('❌ [CONVERT] iOS: Expected bgra8888 format, got $format');
-          return null;
-        }
-        debugPrint('✅ [CONVERT] iOS: BGRA8888 format validated');
+        if (format != InputImageFormat.bgra8888) return null;
       } else {
         if (format != InputImageFormat.nv21 &&
             format != InputImageFormat.yuv420 &&
-            format != InputImageFormat.yuv_420_888) {
-          debugPrint(
-            '❌ [CONVERT] Android: Expected nv21, yuv420, or yuv_420_888 format, got $format',
-          );
-          return null;
-        }
-        debugPrint('✅ [CONVERT] Android: Format validation passed');
-      }
-
-      if (Platform.isIOS) {
-        if (image.planes.length != 1) {
-          debugPrint('❌ [CONVERT] iOS expected 1 plane, got ${image.planes.length}');
-          return null;
-        }
-        debugPrint('✅ [CONVERT] iOS: Single plane validated');
-      } else {
-        if (format == InputImageFormat.nv21) {
-          if (image.planes.length != 1) {
-            debugPrint('❌ [CONVERT] NV21 expected 1 plane, got ${image.planes.length}');
-            return null;
-          }
-        } else if (format == InputImageFormat.yuv420 ||
-            format == InputImageFormat.yuv_420_888) {
-          if (image.planes.isEmpty) {
-            debugPrint('❌ [CONVERT] YUV420/YUV_420_888 has no planes');
-            return null;
-          }
-          debugPrint('🔄 [CONVERT] YUV420/YUV_420_888 has ${image.planes.length} planes, using first plane');
-        }
+            format != InputImageFormat.yuv_420_888) return null;
       }
 
       final plane = image.planes.first;
-      debugPrint('🔄 [CONVERT] Plane bytes length: ${plane.bytes.length}');
-      debugPrint('🔄 [CONVERT] Plane bytes per row: ${plane.bytesPerRow}');
-
       Uint8List bytes;
       InputImageFormat finalFormat = format;
 
@@ -332,10 +318,8 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
           (format == InputImageFormat.yuv420 ||
               format == InputImageFormat.yuv_420_888) &&
           image.planes.length >= 3) {
-        debugPrint('🔄 [CONVERT] Converting YUV_420_888 to NV21...');
         bytes = _convertYUV420ToNV21(image);
         finalFormat = InputImageFormat.nv21;
-        debugPrint('🔄 [CONVERT] Converted bytes length: ${bytes.length}');
       } else {
         final WriteBuffer allBytes = WriteBuffer();
         for (final plane in image.planes) {
@@ -354,29 +338,23 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
         ),
       );
 
-      debugPrint('✅ [CONVERT] InputImage created successfully');
       return inputImage;
     } catch (e) {
-      debugPrint('❌ [CONVERT] Error converting camera image: $e');
-      debugPrint('❌ [CONVERT] Stack trace: ${StackTrace.current}');
+      debugPrint('Error converting camera image: $e');
       return null;
     }
   }
 
   Uint8List _convertYUV420ToNV21(CameraImage image) {
-    debugPrint('🔄 [YUV] Converting YUV420 to NV21...');
     final int width = image.width;
     final int height = image.height;
     final int ySize = width * height;
     final int uvSize = width * height ~/ 4;
-
     final Uint8List nv21 = Uint8List(ySize + uvSize * 2);
 
     final Uint8List yPlane = image.planes[0].bytes;
     final int yRowStride = image.planes[0].bytesPerRow;
     final int yPixelStride = image.planes[0].bytesPerPixel ?? 1;
-
-    debugPrint('🔄 [YUV] Y plane - size: ${yPlane.length}, rowStride: $yRowStride, pixelStride: $yPixelStride');
 
     for (int y = 0; y < height; y++) {
       for (int x = 0; x < width; x++) {
@@ -390,9 +368,6 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     final int vRowStride = image.planes[2].bytesPerRow;
     final int uPixelStride = image.planes[1].bytesPerPixel ?? 1;
     final int vPixelStride = image.planes[2].bytesPerPixel ?? 1;
-
-    debugPrint('🔄 [YUV] U plane - size: ${uPlane.length}, rowStride: $uRowStride, pixelStride: $uPixelStride');
-    debugPrint('🔄 [YUV] V plane - size: ${vPlane.length}, rowStride: $vRowStride, pixelStride: $vPixelStride');
 
     int uvIndex = ySize;
     for (int y = 0; y < height ~/ 2; y++) {
@@ -410,7 +385,6 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
       }
     }
 
-    debugPrint('✅ [YUV] YUV420 to NV21 conversion complete');
     return nv21;
   }
 
@@ -421,7 +395,7 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
 
     try {
       await _audioPlayer.play(AssetSource('sounds/beep.wav'), volume: 0.5);
-      if (await Vibration.hasVibrator() ?? false) {
+      if (await Vibration.hasVibrator()) {
         Vibration.vibrate(pattern: [0, 300, 150, 300]);
       }
     } catch (e) {
@@ -437,7 +411,7 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
         debugPrint("⚠️ Escalating Alert: Still no acknowledgment.");
         try {
           await _audioPlayer.play(AssetSource('sounds/alarm.wav'), volume: 1.0);
-          if (await Vibration.hasVibrator() ?? false) {
+          if (await Vibration.hasVibrator()) {
             Vibration.vibrate(pattern: [0, 600, 200, 600, 200, 600]);
           }
         } catch (e) {
@@ -517,29 +491,40 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
     }
   }
 
+  Future<void> _logout() async {
+    await context.read<AuthService>().logout();
+    if (mounted) {
+      Navigator.of(context).pushReplacementNamed('/');
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    
-    // Stop detection first
+
     _stopDetection();
-    
-    // Clean up timers
+    _locationUpdateTimer?.cancel();
     _eyeClosureTimer?.cancel();
     _alertEscalationTimer?.cancel();
     _autoStopTimer?.cancel();
-    
-    // Clean up audio
+
     _audioPlayer.dispose();
-    
-    // Clean up face detector
     _faceDetector.close();
-    
-    // Clean up camera controller
+
     if (_controller != null) {
       _controller!.dispose();
     }
-    
+
+    // Stop monitoring services
+    final auth = context.read<AuthService>();
+    final monitoringService = context.read<MonitoringService>();
+    final locationService = context.read<LocationService>();
+
+    if (auth.currentUser != null) {
+      monitoringService.stopMonitoring(auth.currentUser!.id);
+    }
+    locationService.stopLocationTracking();
+
     super.dispose();
   }
 
@@ -550,32 +535,248 @@ class _DriverScreenState extends State<DriverScreen> with WidgetsBindingObserver
         body: Center(child: CircularProgressIndicator()),
       );
     }
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Driver Mode')),
+      appBar: AppBar(
+        title: const Text('Driver Mode'),
+        backgroundColor: Colors.blue,
+        foregroundColor: Colors.white,
+        actions: [
+          Consumer<AuthService>(
+            builder: (context, auth, _) {
+              return PopupMenuButton<String>(
+                onSelected: (value) {
+                  if (value == 'logout') {
+                    _logout();
+                  }
+                },
+                itemBuilder: (context) => [
+                  PopupMenuItem(
+                    value: 'info',
+                    child: ListTile(
+                      leading: const Icon(Icons.info),
+                      title: Text(
+                          'Driver: ${auth.currentUser?.email ?? 'Unknown'}'),
+                      subtitle: Text(
+                          'Bus: ${auth.currentUser?.busNumber ?? 'Unknown'}'),
+                    ),
+                  ),
+                  const PopupMenuItem(
+                    value: 'logout',
+                    child: ListTile(
+                      leading: Icon(Icons.logout),
+                      title: Text('Logout'),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
       body: Column(
         children: [
-          Expanded(
-            child: CameraPreview(_controller!),
+          // Status indicator
+          Consumer3<MonitoringService, LocationService, AuthService>(
+            builder: (context, monitoring, location, auth, _) {
+              return Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                color: monitoring.isMonitoring && location.isTracking
+                    ? Colors.green[100]
+                    : Colors.orange[100],
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      monitoring.isMonitoring && location.isTracking
+                          ? Icons.security
+                          : Icons.warning,
+                      color: monitoring.isMonitoring && location.isTracking
+                          ? Colors.green
+                          : Colors.orange,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      monitoring.isMonitoring && location.isTracking
+                          ? 'Monitoring Active - HQ Connected'
+                          : 'Monitoring Inactive',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: monitoring.isMonitoring && location.isTracking
+                            ? Colors.green[700]
+                            : Colors.orange[700],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
+
+          // Camera preview
+          Expanded(
+            child: Stack(
+              children: [
+                CameraPreview(_controller!),
+
+                // Drowsiness indicator overlay
+                if (_closedEyeFrames > 10)
+                  Positioned(
+                    top: 20,
+                    left: 20,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: _closedEyeFrames > 20
+                            ? Colors.red.withOpacity(0.9)
+                            : Colors.orange.withOpacity(0.9),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.remove_red_eye,
+                            color: Colors.white,
+                            size: 16,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Eyes Closed: $_closedEyeFrames',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+
+          // Location and monitoring info
+          Consumer2<LocationService, MonitoringService>(
+            builder: (context, location, monitoring, _) {
+              return Container(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        _buildInfoCard(
+                          'Location',
+                          location.currentPosition != null
+                              ? 'Active'
+                              : 'Inactive',
+                          location.currentPosition != null
+                              ? Icons.location_on
+                              : Icons.location_off,
+                          location.currentPosition != null
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                        _buildInfoCard(
+                          'Monitoring',
+                          monitoring.isMonitoring ? 'Active' : 'Inactive',
+                          monitoring.isMonitoring
+                              ? Icons.visibility
+                              : Icons.visibility_off,
+                          monitoring.isMonitoring ? Colors.green : Colors.red,
+                        ),
+                        _buildInfoCard(
+                          'HQ Connection',
+                          monitoring.currentDriverStatus?.isOnline == true
+                              ? 'Online'
+                              : 'Offline',
+                          monitoring.currentDriverStatus?.isOnline == true
+                              ? Icons.cloud_done
+                              : Icons.cloud_off,
+                          monitoring.currentDriverStatus?.isOnline == true
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                      ],
+                    ),
+                    if (location.currentPosition != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Speed: ${(location.currentPosition!.speed * 3.6).toStringAsFixed(1)} km/h',
+                          style:
+                              const TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+
+          // Control buttons
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                ElevatedButton(
-                  onPressed: (!_isDetecting && !_isStreamingImages) ? _startDetection : null,
-                  child: Text(_isStreamingImages ? 'Detection Running...' : 'Start Detection'),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: (!_isDetecting && !_isStreamingImages)
+                        ? _startDetection
+                        : null,
+                    icon: const Icon(Icons.play_arrow),
+                    label: Text(_isStreamingImages
+                        ? 'Detection Active'
+                        : 'Start Detection'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor:
+                          _isStreamingImages ? Colors.green : Colors.blue,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
                 ),
-                const SizedBox(width: 20),
-                ElevatedButton(
-                  onPressed: _isStreamingImages ? _stopDetection : null,
-                  child: const Text('Stop Detection'),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isStreamingImages ? _stopDetection : null,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop Detection'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
                 ),
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildInfoCard(
+      String title, String value, IconData icon, Color color) {
+    return Column(
+      children: [
+        Icon(icon, color: color, size: 24),
+        const SizedBox(height: 4),
+        Text(
+          title,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+        ),
+        Text(
+          value,
+          style: TextStyle(fontSize: 10, color: color),
+        ),
+      ],
     );
   }
 }
