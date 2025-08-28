@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'auth_service.dart';
+import 'user_type.dart';
 
 class LoginScreen extends StatefulWidget {
   final UserType userType;
@@ -8,253 +9,207 @@ class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key, required this.userType});
 
   @override
-  State<LoginScreen> createState() => _LoginScreenState();
+  _LoginScreenState createState() => _LoginScreenState();
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _formKey = GlobalKey<FormState>();
-  final _emailController = TextEditingController();
-  final _passwordController = TextEditingController();
-  final _ticketController = TextEditingController();
-  bool _obscurePassword = true;
+  // Only create the controllers you need
+  TextEditingController? _emailController;
+  TextEditingController? _passwordController;
+  TextEditingController? _ticketController;
 
   @override
-  void dispose() {
-    _emailController.dispose();
-    _passwordController.dispose();
-    _ticketController.dispose();
-    super.dispose();
+  void initState() {
+    super.initState();
+    if (widget.userType == UserType.driver) {
+      _emailController = TextEditingController();
+      _passwordController = TextEditingController();
+    } else {
+      _ticketController = TextEditingController();
+    }
   }
 
-  Future<void> _handleLogin() async {
-    if (!_formKey.currentState!.validate()) return;
+  Future<void> _login(BuildContext context) async {
+    final authService = Provider.of<AuthService>(context, listen: false);
 
-    final authService = context.read<AuthService>();
     bool success = false;
-
+    
     if (widget.userType == UserType.driver) {
+      if (_emailController!.text.trim().isEmpty || _passwordController!.text.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Please fill in all fields")),
+        );
+        return;
+      }
       success = await authService.loginDriver(
-        _emailController.text.trim(),
-        _passwordController.text,
+        _emailController!.text.trim(),
+        _passwordController!.text.trim(),
       );
     } else {
+      if (_ticketController!.text.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Please enter your ticket number")),
+        );
+        return;
+      }
       success = await authService.loginPassenger(
-        _ticketController.text.trim(),
+        _ticketController!.text.trim(),
       );
     }
 
     if (success && mounted) {
-      Navigator.of(context).pushReplacementNamed(
-        widget.userType == UserType.driver ? '/driver' : '/passenger',
+      // Navigate back to the AuthWrapper, which will automatically redirect to the appropriate screen
+      Navigator.of(context).pushNamedAndRemoveUntil(
+        '/auth', 
+        (route) => false, // Remove all previous routes
       );
-    } else if (!success && authService.errorMessage != null && mounted) {
+    } else if (!success && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(authService.errorMessage!)),
+        SnackBar(content: Text(authService.errorMessage ?? "Login failed")),
       );
     }
+  }
+
+  @override
+  void dispose() {
+    _emailController?.dispose();
+    _passwordController?.dispose();
+    _ticketController?.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          '${widget.userType == UserType.driver ? 'Driver' : 'Passenger'} Login',
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: widget.userType == UserType.driver 
+              ? [Colors.blue, Colors.blueAccent]
+              : [Colors.green, Colors.greenAccent],
+          ),
         ),
-        backgroundColor:
-            widget.userType == UserType.driver ? Colors.blue : Colors.green,
-      ),
-      body: Consumer<AuthService>(
-        builder: (context, authService, child) {
-          return Padding(
-            padding: const EdgeInsets.all(20.0),
-            child: Form(
-              key: _formKey,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Icon(
-                      widget.userType == UserType.driver
-                          ? Icons.drive_eta
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Card(
+                elevation: 8,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(32),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        widget.userType == UserType.driver 
+                          ? Icons.drive_eta 
                           : Icons.person,
-                      size: 80,
-                      color: widget.userType == UserType.driver
-                          ? Colors.blue
+                        size: 64,
+                        color: widget.userType == UserType.driver 
+                          ? Colors.blue 
                           : Colors.green,
-                    ),
-                    const SizedBox(height: 30),
-
-                    Text(
-                      widget.userType == UserType.driver
-                          ? 'Driver Login'
-                          : 'Passenger Login',
-                      style: Theme.of(context).textTheme.headlineSmall,
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 30),
-
-                    if (widget.userType == UserType.driver) ...[
-                      // Email field
-                      TextFormField(
-                        controller: _emailController,
-                        keyboardType: TextInputType.emailAddress,
-                        decoration: const InputDecoration(
-                          labelText: 'Company Email',
-                          prefixIcon: Icon(Icons.email),
-                          border: OutlineInputBorder(),
-                        ),
-                        validator: (value) {
-                          if (value == null || value.isEmpty) {
-                            return 'Please enter your email';
-                          }
-                          if (!RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$')
-                              .hasMatch(value)) {
-                            return 'Please enter a valid email';
-                          }
-                          return null;
-                        },
                       ),
-                      const SizedBox(height: 20),
-
-                      // Password field
-                      TextFormField(
-                        controller: _passwordController,
-                        obscureText: _obscurePassword,
-                        decoration: InputDecoration(
-                          labelText: 'Password',
-                          prefixIcon: const Icon(Icons.lock),
-                          suffixIcon: IconButton(
-                            icon: Icon(_obscurePassword
-                                ? Icons.visibility
-                                : Icons.visibility_off),
-                            onPressed: () {
-                              setState(() {
-                                _obscurePassword = !_obscurePassword;
-                              });
-                            },
+                      const SizedBox(height: 16),
+                      Text(
+                        widget.userType == UserType.driver
+                            ? "Driver Login"
+                            : "Passenger Login",
+                        style: const TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 32),
+                      
+                      if (widget.userType == UserType.driver) ...[
+                        TextField(
+                          controller: _emailController,
+                          decoration: const InputDecoration(
+                            labelText: "Email",
+                            prefixIcon: Icon(Icons.email),
+                            border: OutlineInputBorder(),
                           ),
-                          border: const OutlineInputBorder(),
+                          keyboardType: TextInputType.emailAddress,
                         ),
-                        validator: (value) {
-                          if (value == null || value.isEmpty) {
-                            return 'Please enter your password';
-                          }
-                          if (value.length < 6) {
-                            return 'Password must be at least 6 characters';
-                          }
-                          return null;
-                        },
-                      ),
-                    ] else ...[
-                      // Ticket number field
-                      TextFormField(
-                        controller: _ticketController,
-                        keyboardType: TextInputType.text,
-                        decoration: const InputDecoration(
-                          labelText: 'Ticket Number',
-                          prefixIcon: Icon(Icons.confirmation_number),
-                          border: OutlineInputBorder(),
-                          hintText: 'Enter your ticket number',
+                        const SizedBox(height: 16),
+                        TextField(
+                          controller: _passwordController,
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                            labelText: "Password",
+                            prefixIcon: Icon(Icons.lock),
+                            border: OutlineInputBorder(),
+                          ),
                         ),
-                        validator: (value) {
-                          if (value == null || value.isEmpty) {
-                            return 'Please enter your ticket number';
-                          }
-                          if (value.length < 6) {
-                            return 'Please enter a valid ticket number';
-                          }
-                          return null;
-                        },
-                      ),
-                    ],
-
-                    const SizedBox(height: 30),
-
-                    if (authService.errorMessage != null)
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        margin: const EdgeInsets.only(bottom: 20),
-                        decoration: BoxDecoration(
-                          color: Colors.red[100],
-                          border: Border.all(color: Colors.red),
-                          borderRadius: BorderRadius.circular(8),
+                      ] else ...[
+                        TextField(
+                          controller: _ticketController,
+                          decoration: const InputDecoration(
+                            labelText: "Ticket Number",
+                            prefixIcon: Icon(Icons.confirmation_number),
+                            border: OutlineInputBorder(),
+                            hintText: "TKT-XXXXXXXX-XXXX",
+                          ),
+                          textCapitalization: TextCapitalization.characters,
                         ),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.error, color: Colors.red),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                authService.errorMessage!,
-                                style: const TextStyle(color: Colors.red),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                    ElevatedButton(
-                      onPressed:
-                          authService.isLoading ? null : () => _handleLogin(),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: widget.userType == UserType.driver
-                            ? Colors.blue
-                            : Colors.green,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 15),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      child: authService.isLoading
-                          ? const SizedBox(
-                              height: 20,
-                              width: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  Colors.white,
+                      ],
+                      
+                      const SizedBox(height: 24),
+                      
+                      Consumer<AuthService>(
+                        builder: (context, authService, child) {
+                          return SizedBox(
+                            width: double.infinity,
+                            height: 50,
+                            child: ElevatedButton(
+                              onPressed: authService.isLoading 
+                                ? null 
+                                : () => _login(context),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: widget.userType == UserType.driver 
+                                  ? Colors.blue 
+                                  : Colors.green,
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(8),
                                 ),
                               ),
-                            )
-                          : const Text(
-                              'Login',
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
+                              child: authService.isLoading
+                                ? const SizedBox(
+                                    height: 20,
+                                    width: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Text(
+                                    "Login",
+                                    style: TextStyle(fontSize: 16),
+                                  ),
                             ),
-                    ),
-
-                    const SizedBox(height: 20),
-
-                    TextButton(
-                      onPressed: () {
-                        Navigator.of(context).pop();
-                      },
-                      child: const Text('Back to Mode Selection'),
-                    ),
-
-                    const SizedBox(height: 20),
-                    Text(
-                      widget.userType == UserType.driver
-                          ? 'Note: Use your company-provided email and password'
-                          : 'Note: Each ticket can only be used once',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey,
-                        fontStyle: FontStyle.italic,
+                          );
+                        },
                       ),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
+                      
+                      const SizedBox(height: 16),
+                      
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text("Back to selection"),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
-          );
-        },
+          ),
+        ),
       ),
     );
   }

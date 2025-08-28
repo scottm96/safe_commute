@@ -34,12 +34,12 @@ class DriverStatus {
           ? Position(
               latitude: map['location']['latitude'],
               longitude: map['location']['longitude'],
-              timestamp: (map['location']['timestamp'] as Timestamp).toDate(),
-              accuracy: map['location']['accuracy'] ?? 0.0,
-              altitude: map['location']['altitude'] ?? 0.0,
-              heading: map['location']['heading'] ?? 0.0,
-              speed: map['location']['speed'] ?? 0.0,
-              speedAccuracy: map['location']['speedAccuracy'] ?? 0.0,
+              timestamp: (map['location']['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
+              accuracy: (map['location']['accuracy'] ?? 0.0).toDouble(),
+              altitude: (map['location']['altitude'] ?? 0.0).toDouble(),
+              heading: (map['location']['heading'] ?? 0.0).toDouble(),
+              speed: (map['location']['speed'] ?? 0.0).toDouble(),
+              speedAccuracy: (map['location']['speedAccuracy'] ?? 0.0).toDouble(),
               altitudeAccuracy: 0.0,
               headingAccuracy: 0.0,
             )
@@ -104,6 +104,8 @@ class MonitoringService with ChangeNotifier {
           .map((doc) => DriverStatus.fromMap(doc.data(), doc.id))
           .toList();
       notifyListeners();
+    }, onError: (error) {
+      debugPrint('Error monitoring all drivers: $error');
     });
   }
 
@@ -111,13 +113,15 @@ class MonitoringService with ChangeNotifier {
   Future<void> startDriverMonitoring(String driverId, String busNumber) async {
     _isMonitoring = true;
     
-    // Initialize driver status document
+    // Initialize driver status document with consistent field names
     await _firestore.collection('driver_status').doc(driverId).set({
+      'driverId': driverId, // Add explicit driverId field
       'busNumber': busNumber,
       'isOnline': true,
       'alertLevel': 'none',
       'isDrowsy': false,
       'closedEyeFrames': 0,
+      'location': null,
       'lastUpdate': FieldValue.serverTimestamp(),
     });
 
@@ -131,15 +135,17 @@ class MonitoringService with ChangeNotifier {
         _currentDriverStatus = DriverStatus.fromMap(snapshot.data()!, snapshot.id);
         notifyListeners();
       }
+    }, onError: (error) {
+      debugPrint('Error monitoring current driver: $error');
     });
 
-    // Start heartbeat
+    // Start heartbeat to keep connection alive
     _startHeartbeat(driverId);
     
     notifyListeners();
   }
 
-  // Update driver location
+  // Update driver location with consistent field structure
   Future<void> updateDriverLocation(String driverId, Position position) async {
     if (!_isMonitoring) return;
 
@@ -162,7 +168,7 @@ class MonitoringService with ChangeNotifier {
     }
   }
 
-  // Update drowsiness status
+  // Update drowsiness status with proper alert level mapping
   Future<void> updateDrowsinessStatus(
     String driverId, 
     bool isDrowsy, 
@@ -195,6 +201,10 @@ class MonitoringService with ChangeNotifier {
         await _logIncident(driverId, 'SEVERE_DROWSINESS', {
           'closedEyeFrames': closedEyeFrames,
           'timestamp': FieldValue.serverTimestamp(),
+          'location': _currentDriverStatus?.location != null ? {
+            'latitude': _currentDriverStatus!.location!.latitude,
+            'longitude': _currentDriverStatus!.location!.longitude,
+          } : null,
         });
       }
     } catch (e) {
@@ -207,10 +217,12 @@ class MonitoringService with ChangeNotifier {
     try {
       await _firestore.collection('incidents').add({
         'driverId': driverId,
+        'busNumber': _currentDriverStatus?.busNumber ?? 'Unknown',
         'incidentType': incidentType,
         'timestamp': FieldValue.serverTimestamp(),
         'data': data,
         'resolved': false,
+        'severity': incidentType.contains('SEVERE') ? 'high' : 'medium',
       });
     } catch (e) {
       debugPrint('Error logging incident: $e');
@@ -223,6 +235,7 @@ class MonitoringService with ChangeNotifier {
       if (_isMonitoring) {
         _firestore.collection('driver_status').doc(driverId).update({
           'lastUpdate': FieldValue.serverTimestamp(),
+          'isOnline': true, // Ensure online status is maintained
         }).catchError((error) {
           debugPrint('Heartbeat error: $error');
         });
@@ -246,6 +259,7 @@ class MonitoringService with ChangeNotifier {
 
     // Cancel subscriptions and timers
     _currentDriverSubscription?.cancel();
+    _driversSubscription?.cancel();
     _heartbeatTimer?.cancel();
     
     _currentDriverStatus = null;

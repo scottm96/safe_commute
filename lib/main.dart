@@ -1,18 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:provider/provider.dart';
+import 'firebase_options.dart';
 import 'auth_service.dart';
+import 'monitoring_service.dart';
+import 'location_service.dart';
+import 'user_type.dart';
+import 'login_screen.dart';
 import 'driver_screen.dart';
 import 'passenger_screen.dart';
+import 'passengerCount_service.dart';
 
-void main() {
-  runApp(
-    MultiProvider(
-      providers: [
-        ChangeNotifierProvider(create: (_) => AuthService()),
-      ],
-      child: const SafeCommuteApp(),
-    ),
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
   );
+  runApp(const SafeCommuteApp());
 }
 
 class SafeCommuteApp extends StatelessWidget {
@@ -20,137 +24,161 @@ class SafeCommuteApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Transport Monitoring',
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: const LoginScreen(),
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => AuthService()),
+        ChangeNotifierProvider(create: (_) => MonitoringService()),
+        ChangeNotifierProvider(create: (_) => LocationService()),
+        ChangeNotifierProvider(create: (_) => PassengerCountService()),
+      ],
+      child: MaterialApp(
+        title: 'SafeCommute',
+        theme: ThemeData(
+          primarySwatch: Colors.blue,
+          visualDensity: VisualDensity.adaptivePlatformDensity,
+        ),
+        home: const AuthWrapper(), // Keep home property
+        routes: {
+          '/auth': (context) =>
+              const AuthWrapper(), // Add this for navigation after login
+          '/driver-login': (context) =>
+              const LoginScreen(userType: UserType.driver),
+          '/passenger-login': (context) =>
+              const LoginScreen(userType: UserType.passenger),
+        },
+        debugShowCheckedModeBanner: false,
+      ),
     );
   }
 }
 
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
-
-  @override
-  State<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreen> {
-  final _formKey = GlobalKey<FormState>();
-  final TextEditingController _emailOrTicketController =
-      TextEditingController();
-  final TextEditingController _passwordController = TextEditingController();
-  bool _isDriver = true;
-
-  Future<void> _handleLogin(AuthService authService) async {
-    if (!_formKey.currentState!.validate()) return;
-
-    bool success = false;
-
-    if (_isDriver) {
-      success = await authService.loginDriver(
-        _emailOrTicketController.text.trim(),
-        _passwordController.text.trim(),
-      );
-    } else {
-      success = await authService.loginPassenger(
-        _emailOrTicketController.text.trim(),
-      );
-    }
-
-    if (success && mounted) {
-      if (_isDriver) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const DriverScreen()),
-        );
-      } else {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const PassengerScreen()),
-        );
-      }
-    } else if (!success) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(authService.errorMessage ?? 'Login failed. Please try again.'),
-        ),
-      );
-    }
-  }
+class AuthWrapper extends StatelessWidget {
+  const AuthWrapper({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final authService = Provider.of<AuthService>(context);
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('Login')),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Form(
-            key: _formKey,
-            child: ListView(
-              shrinkWrap: true,
-              children: [
-                SwitchListTile(
-                  title: Text(_isDriver ? 'Driver Login' : 'Passenger Login'),
-                  value: _isDriver,
-                  onChanged: (val) {
-                    setState(() {
-                      _isDriver = val;
-                      _emailOrTicketController.clear();
-                      _passwordController.clear();
-                    });
-                  },
-                ),
-                const SizedBox(height: 20),
-                TextFormField(
-                  controller: _emailOrTicketController,
-                  decoration: InputDecoration(
-                    labelText: _isDriver ? 'Email' : 'Ticket Number',
-                    border: const OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.isEmpty) {
-                      return _isDriver
-                          ? 'Please enter your email'
-                          : 'Please enter your ticket number';
-                    }
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 20),
-                if (_isDriver)
-                  TextFormField(
-                    controller: _passwordController,
-                    decoration: const InputDecoration(
-                      labelText: 'Password',
-                      border: OutlineInputBorder(),
-                    ),
-                    obscureText: true,
-                    validator: (value) {
-                      if (_isDriver &&
-                          (value == null || value.isEmpty)) {
-                        return 'Please enter your password';
-                      }
-                      return null;
-                    },
-                  ),
-                const SizedBox(height: 20),
-                ElevatedButton(
-                  onPressed: authService.isLoading
-                      ? null
-                      : () => _handleLogin(authService),
-                  child: authService.isLoading
-                      ? const CircularProgressIndicator(
-                          valueColor: AlwaysStoppedAnimation<Color>(
-                            Colors.white,
-                          ),
-                        )
-                      : const Text('Login'),
-                ),
-              ],
+    return Consumer<AuthService>(
+      builder: (context, auth, _) {
+        if (auth.isLoading) {
+          return const Scaffold(
+            body: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Loading...', style: TextStyle(fontSize: 16)),
+                ],
+              ),
             ),
+          );
+        }
+
+        if (auth.currentUser == null) {
+          return const UserTypeSelector();
+        }
+
+        // Route to appropriate screen based on user type
+        if (auth.currentUser!.userType == UserType.driver) {
+          return const DriverScreen();
+        } else {
+          return const PassengerScreen();
+        }
+      },
+    );
+  }
+}
+
+class UserTypeSelector extends StatelessWidget {
+  const UserTypeSelector({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Colors.blue, Colors.blueAccent],
+          ),
+        ),
+        child: SafeArea(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(
+                Icons.directions_bus,
+                size: 80,
+                color: Colors.white,
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                'SafeCommute',
+                style: TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                'Choose your login type',
+                style: TextStyle(
+                  fontSize: 18,
+                  color: Colors.white70,
+                ),
+              ),
+              const SizedBox(height: 40),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 40),
+                child: Column(
+                  children: [
+                    SizedBox(
+                      width: double.infinity,
+                      height: 60,
+                      child: ElevatedButton.icon(
+                        onPressed: () =>
+                            Navigator.pushNamed(context, '/driver-login'),
+                        icon: const Icon(Icons.drive_eta, size: 24),
+                        label: const Text(
+                          'Driver Login',
+                          style: TextStyle(fontSize: 18),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.blue,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(30),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 60,
+                      child: ElevatedButton.icon(
+                        onPressed: () =>
+                            Navigator.pushNamed(context, '/passenger-login'),
+                        icon: const Icon(Icons.person, size: 24),
+                        label: const Text(
+                          'Passenger Login',
+                          style: TextStyle(fontSize: 18),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(30),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
       ),

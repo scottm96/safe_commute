@@ -3,8 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
-
-enum UserType { driver, passenger }
+import 'user_type.dart';
 
 class AppUser {
   final String id;
@@ -29,7 +28,8 @@ class AppUser {
     return AppUser(
       id: id,
       email: map['email'] ?? '',
-      userType: map['userType'] == 'driver' ? UserType.driver : UserType.passenger,
+      userType:
+          map['userType'] == 'driver' ? UserType.driver : UserType.passenger,
       ticketNumber: map['ticketNumber'],
       companyId: map['companyId'],
       busNumber: map['busNumber'],
@@ -53,7 +53,7 @@ class AppUser {
 class AuthService with ChangeNotifier {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  
+
   AppUser? _currentUser;
   bool _isLoading = false;
   String? _errorMessage;
@@ -87,13 +87,13 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Driver Login
+  // Driver Login with better error handling
   Future<bool> loginDriver(String email, String password) async {
     _setLoading(true);
     _clearError();
 
     try {
-      // First verify the driver exists in the company database
+      // First check if driver exists in Firestore
       final driverQuery = await _firestore
           .collection('drivers')
           .where('email', isEqualTo: email)
@@ -106,7 +106,7 @@ class AuthService with ChangeNotifier {
       }
 
       final driverData = driverQuery.docs.first.data();
-      
+
       // Verify password hash
       final hashedPassword = sha256.convert(utf8.encode(password)).toString();
       if (driverData['passwordHash'] != hashedPassword) {
@@ -114,28 +114,53 @@ class AuthService with ChangeNotifier {
         return false;
       }
 
-      // Check if driver is already logged in
       if (driverData['currentSession'] != null) {
         _setError('Driver already has an active session');
         return false;
       }
 
-      // Create Firebase Auth user or sign in
-      UserCredential userCredential;
+      // Try Firebase authentication with better error handling
+      UserCredential? userCredential;
+      
       try {
+        // First try to sign in
         userCredential = await _auth.signInWithEmailAndPassword(
           email: email,
           password: password,
         );
+      } on FirebaseAuthException catch (authError) {
+        debugPrint('Sign in failed: ${authError.code} - ${authError.message}');
+        
+        // If user doesn't exist, try to create account
+        if (authError.code == 'user-not-found' || 
+            authError.code == 'invalid-credential' ||
+            authError.code == 'invalid-email') {
+          try {
+            userCredential = await _auth.createUserWithEmailAndPassword(
+              email: email,
+              password: password,
+            );
+            debugPrint('Created new Firebase Auth user for driver');
+          } on FirebaseAuthException catch (createError) {
+            debugPrint('Account creation failed: ${createError.code} - ${createError.message}');
+            _setError('Authentication failed: ${createError.message}');
+            return false;
+          }
+        } else {
+          _setError('Authentication failed: ${authError.message}');
+          return false;
+        }
       } catch (e) {
-        // If user doesn't exist in Auth, create them
-        userCredential = await _auth.createUserWithEmailAndPassword(
-          email: email,
-          password: password,
-        );
+        debugPrint('Unexpected auth error: $e');
+        _setError('Authentication failed: Unexpected error');
+        return false;
       }
 
-      // Create/update user document
+      if (userCredential.user == null) {
+        _setError('Authentication failed: No user returned');
+        return false;
+      }
+
       final appUser = AppUser(
         id: userCredential.user!.uid,
         email: email,
@@ -144,6 +169,7 @@ class AuthService with ChangeNotifier {
         busNumber: driverData['busNumber'],
       );
 
+      // Create/update user document
       await _firestore.collection('users').doc(appUser.id).set(appUser.toMap());
 
       // Update driver session
@@ -157,8 +183,8 @@ class AuthService with ChangeNotifier {
 
       _currentUser = appUser;
       return true;
-
     } catch (e) {
+      debugPrint('Driver login error: $e');
       _setError('Login failed: ${e.toString()}');
       return false;
     } finally {
@@ -166,13 +192,12 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Passenger Login
+  // Passenger Login with better error handling
   Future<bool> loginPassenger(String ticketNumber) async {
     _setLoading(true);
     _clearError();
 
     try {
-      // Verify ticket exists and is valid
       final ticketQuery = await _firestore
           .collection('tickets')
           .where('ticketNumber', isEqualTo: ticketNumber)
@@ -186,17 +211,31 @@ class AuthService with ChangeNotifier {
       }
 
       final ticketData = ticketQuery.docs.first.data();
-      
-      // Check if ticket already has an active session
+
       if (ticketData['currentSession'] != null) {
         _setError('Ticket is already in use');
         return false;
       }
 
-      // Create anonymous user for passenger
-      final userCredential = await _auth.signInAnonymously();
+      // Sign in anonymously with error handling
+      UserCredential? userCredential;
+      try {
+        userCredential = await _auth.signInAnonymously();
+      } on FirebaseAuthException catch (authError) {
+        debugPrint('Anonymous sign in failed: ${authError.code} - ${authError.message}');
+        _setError('Authentication failed: ${authError.message}');
+        return false;
+      } catch (e) {
+        debugPrint('Unexpected anonymous auth error: $e');
+        _setError('Authentication failed: Unexpected error');
+        return false;
+      }
 
-      // Create user document
+      if (userCredential.user == null) {
+        _setError('Authentication failed: No user returned');
+        return false;
+      }
+
       final appUser = AppUser(
         id: userCredential.user!.uid,
         email: 'passenger_$ticketNumber@temp.com',
@@ -204,6 +243,7 @@ class AuthService with ChangeNotifier {
         ticketNumber: ticketNumber,
       );
 
+      // Create user document
       await _firestore.collection('users').doc(appUser.id).set(appUser.toMap());
 
       // Update ticket session
@@ -213,12 +253,13 @@ class AuthService with ChangeNotifier {
           .update({
         'currentSession': userCredential.user!.uid,
         'lastUsed': FieldValue.serverTimestamp(),
+        'isUsed': true,
       });
 
       _currentUser = appUser;
       return true;
-
     } catch (e) {
+      debugPrint('Passenger login error: $e');
       _setError('Login failed: ${e.toString()}');
       return false;
     } finally {
@@ -226,26 +267,42 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Logout
+  // Logout with better error handling
   Future<void> logout() async {
     _setLoading(true);
 
     try {
       if (_currentUser != null) {
-        // Clear sessions in respective collections
         if (_currentUser!.userType == UserType.driver) {
           await _clearDriverSession();
         } else {
           await _clearPassengerSession();
         }
 
-        // Remove user document
-        await _firestore.collection('users').doc(_currentUser!.id).delete();
+        // Delete user document
+        try {
+          await _firestore.collection('users').doc(_currentUser!.id).delete();
+        } catch (e) {
+          debugPrint('Error deleting user document: $e');
+        }
+
+        // Remove from driver_status if exists
+        try {
+          await _firestore.collection('driver_status').doc(_currentUser!.id).delete();
+        } catch (e) {
+          debugPrint('No driver status to delete: $e');
+        }
       }
 
-      await _auth.signOut();
+      // Sign out with error handling
+      try {
+        await _auth.signOut();
+      } on FirebaseAuthException catch (e) {
+        debugPrint('Sign out error: ${e.code} - ${e.message}');
+      }
+      
       _currentUser = null;
-
+      _clearError();
     } catch (e) {
       debugPrint('Logout error: $e');
     } finally {
@@ -255,26 +312,34 @@ class AuthService with ChangeNotifier {
 
   Future<void> _clearDriverSession() async {
     if (_currentUser?.companyId != null) {
-      final driverQuery = await _firestore
-          .collection('drivers')
-          .where('currentSession', isEqualTo: _currentUser!.id)
-          .get();
+      try {
+        final driverQuery = await _firestore
+            .collection('drivers')
+            .where('currentSession', isEqualTo: _currentUser!.id)
+            .get();
 
-      for (final doc in driverQuery.docs) {
-        await doc.reference.update({'currentSession': null});
+        for (final doc in driverQuery.docs) {
+          await doc.reference.update({'currentSession': null});
+        }
+      } catch (e) {
+        debugPrint('Error clearing driver session: $e');
       }
     }
   }
 
   Future<void> _clearPassengerSession() async {
     if (_currentUser?.ticketNumber != null) {
-      final ticketQuery = await _firestore
-          .collection('tickets')
-          .where('currentSession', isEqualTo: _currentUser!.id)
-          .get();
+      try {
+        final ticketQuery = await _firestore
+            .collection('tickets')
+            .where('currentSession', isEqualTo: _currentUser!.id)
+            .get();
 
-      for (final doc in ticketQuery.docs) {
-        await doc.reference.update({'currentSession': null});
+        for (final doc in ticketQuery.docs) {
+          await doc.reference.update({'currentSession': null});
+        }
+      } catch (e) {
+        debugPrint('Error clearing passenger session: $e');
       }
     }
   }

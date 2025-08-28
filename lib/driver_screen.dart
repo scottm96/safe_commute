@@ -20,12 +20,13 @@ class DriverScreen extends StatefulWidget {
 }
 
 class _DriverScreenState extends State<DriverScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, AutomaticKeepAliveClientMixin {
   CameraController? _controller;
   List<CameraDescription>? cameras;
   late FaceDetector _faceDetector;
   bool _isDetecting = false;
   bool _isStreamingImages = false;
+  bool _cameraInitialized = false;
   Timer? _eyeClosureTimer;
   int _closedEyeFrames = 0;
   bool _alertTriggered = false;
@@ -42,12 +43,19 @@ class _DriverScreenState extends State<DriverScreen>
   };
 
   @override
+  bool get wantKeepAlive => true; // Keep widget alive
+
+  @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initializeFaceDetector();
-    _initializeCamera();
-    _startLocationTracking();
+    
+    // Delay camera initialization to ensure proper widget mounting
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeCamera();
+      _startLocationTracking();
+    });
   }
 
   @override
@@ -61,7 +69,10 @@ class _DriverScreenState extends State<DriverScreen>
         state == AppLifecycleState.detached) {
       _stopDetection();
     } else if (state == AppLifecycleState.resumed) {
-      // Optionally restart detection if it was running before
+      // Re-initialize camera if needed
+      if (!_cameraInitialized) {
+        _initializeCamera();
+      }
     }
   }
 
@@ -77,11 +88,13 @@ class _DriverScreenState extends State<DriverScreen>
 
   Future<void> _initializeCamera() async {
     try {
+      debugPrint("Initializing camera...");
       cameras = await availableCameras();
       if (cameras == null || cameras!.isEmpty) {
         debugPrint("No cameras available");
         return;
       }
+      
       final frontCamera = cameras!.firstWhere(
         (cam) => cam.lensDirection == CameraLensDirection.front,
         orElse: () => cameras!.first,
@@ -89,15 +102,29 @@ class _DriverScreenState extends State<DriverScreen>
 
       _controller = CameraController(
         frontCamera,
-        ResolutionPreset.low,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        ResolutionPreset.medium, // Changed from low to medium for better detection
+        imageFormatGroup: Platform.isAndroid 
+            ? ImageFormatGroup.yuv420 
+            : ImageFormatGroup.bgra8888,
+        enableAudio: false,
       );
+      
       await _controller!.initialize();
+      _cameraInitialized = true;
+      
       if (mounted) {
         setState(() {});
+        debugPrint("Camera initialized successfully");
       }
     } catch (e) {
       debugPrint("Camera initialization error: $e");
+      _cameraInitialized = false;
+      // Retry initialization after a delay
+      Timer(const Duration(seconds: 2), () {
+        if (mounted && !_cameraInitialized) {
+          _initializeCamera();
+        }
+      });
     }
   }
 
@@ -113,8 +140,8 @@ class _DriverScreenState extends State<DriverScreen>
         auth.currentUser!.busNumber ?? 'Unknown',
       );
 
-      // Start location tracking
-      await locationService.startLocationTracking(
+      // Start location tracking with proper error handling
+      bool locationStarted = await locationService.startLocationTracking(
         onLocationUpdate: (Position position) {
           // Update location in monitoring service
           monitoringService.updateDriverLocation(
@@ -122,26 +149,42 @@ class _DriverScreenState extends State<DriverScreen>
         },
       );
 
-      // Start periodic location updates
-      _locationUpdateTimer =
-          Timer.periodic(const Duration(seconds: 30), (timer) async {
-        final position = await locationService.getCurrentLocation();
-        if (position != null) {
-          monitoringService.updateDriverLocation(
-              auth.currentUser!.id, position);
+      if (locationStarted) {
+        debugPrint("Location tracking started successfully");
+        // Start periodic location updates
+        _locationUpdateTimer =
+            Timer.periodic(const Duration(seconds: 30), (timer) async {
+          final position = await locationService.getCurrentLocation();
+          if (position != null) {
+            monitoringService.updateDriverLocation(
+                auth.currentUser!.id, position);
+          }
+        });
+      } else {
+        debugPrint("Failed to start location tracking");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location permissions required for monitoring'),
+              backgroundColor: Colors.orange,
+            ),
+          );
         }
-      });
+      }
     }
   }
 
   void _startDetection() {
-    if (_controller == null || !_controller!.value.isInitialized) {
-      debugPrint("Camera not initialized");
+    if (_controller == null || !_controller!.value.isInitialized || !_cameraInitialized) {
+      debugPrint("Camera not ready for detection");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Camera not ready. Please wait.')),
+      );
       return;
     }
 
     if (_isDetecting || _isStreamingImages) {
-      debugPrint("Detection already running or image stream active");
+      debugPrint("Detection already running");
       return;
     }
 
@@ -150,18 +193,19 @@ class _DriverScreenState extends State<DriverScreen>
 
     try {
       _controller!.startImageStream((CameraImage image) {
-        if (!_isDetecting) return;
+        if (!_isDetecting || !mounted) return;
 
         if (_isDetecting) {
           _isDetecting = false;
           _processCameraImage(image).then((_) {
-            _isDetecting = true;
+            if (mounted) _isDetecting = true;
           }).catchError((error) {
             debugPrint("Error processing image: $error");
-            _isDetecting = true;
+            if (mounted) _isDetecting = true;
           });
         }
       });
+      debugPrint("Image stream started successfully");
     } catch (e) {
       debugPrint("Error starting image stream: $e");
       _isDetecting = false;
@@ -201,10 +245,10 @@ class _DriverScreenState extends State<DriverScreen>
     }
   }
 
+  // [Rest of the methods remain the same - _processCameraImage, _getInputImageFromCameraImage, etc.]
   Future<void> _processCameraImage(CameraImage image) async {
     final inputImage = _getInputImageFromCameraImage(image, _controller!);
     if (inputImage == null) {
-      debugPrint("Failed to get a valid InputImage.");
       return;
     }
 
@@ -247,12 +291,10 @@ class _DriverScreenState extends State<DriverScreen>
     }
   }
 
-  // [Include the same image processing methods from the original file]
   InputImage? _getInputImageFromCameraImage(
     CameraImage image,
     CameraController controller,
   ) {
-    debugPrint('Starting image conversion...');
     try {
       final camera = controller.description;
       final sensorOrientation = camera.sensorOrientation;
@@ -530,9 +572,27 @@ class _DriverScreenState extends State<DriverScreen>
 
   @override
   Widget build(BuildContext context) {
-    if (_controller == null || !_controller!.value.isInitialized) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
+    super.build(context); // Required for AutomaticKeepAliveClientMixin
+
+    if (!_cameraInitialized || _controller == null || !_controller!.value.isInitialized) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Driver Mode'),
+          backgroundColor: Colors.blue,
+          foregroundColor: Colors.white,
+        ),
+        body: const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Initializing camera...'),
+              SizedBox(height: 8),
+              Text('Please wait while we set up your safety monitoring.'),
+            ],
+          ),
+        ),
       );
     }
 
@@ -671,13 +731,13 @@ class _DriverScreenState extends State<DriverScreen>
                       children: [
                         _buildInfoCard(
                           'Location',
-                          location.currentPosition != null
+                          location.currentPosition != null && location.isTracking
                               ? 'Active'
                               : 'Inactive',
-                          location.currentPosition != null
+                          location.currentPosition != null && location.isTracking
                               ? Icons.location_on
                               : Icons.location_off,
-                          location.currentPosition != null
+                          location.currentPosition != null && location.isTracking
                               ? Colors.green
                               : Colors.red,
                         ),
@@ -712,6 +772,14 @@ class _DriverScreenState extends State<DriverScreen>
                               const TextStyle(fontSize: 12, color: Colors.grey),
                         ),
                       ),
+                    if (location.errorMessage != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Location Error: ${location.errorMessage}',
+                          style: const TextStyle(fontSize: 10, color: Colors.red),
+                        ),
+                      ),
                   ],
                 ),
               );
@@ -726,7 +794,7 @@ class _DriverScreenState extends State<DriverScreen>
               children: [
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: (!_isDetecting && !_isStreamingImages)
+                    onPressed: (!_isDetecting && !_isStreamingImages && _cameraInitialized)
                         ? _startDetection
                         : null,
                     icon: const Icon(Icons.play_arrow),
