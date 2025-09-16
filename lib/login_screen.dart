@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'auth_service.dart';
 import 'user_type.dart';
+import 'route_selection_screen.dart'; // New import for passenger flow
 
 class LoginScreen extends StatefulWidget {
   final UserType userType;
@@ -25,7 +26,13 @@ class _LoginScreenState extends State<LoginScreen> {
       _emailController = TextEditingController();
       _passwordController = TextEditingController();
     } else {
-      _ticketController = TextEditingController();
+      // For passenger, redirect to route selection instead of ticket entry
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (context) => const RouteSelectionScreen()),
+        );
+      });
     }
   }
 
@@ -46,22 +53,14 @@ class _LoginScreenState extends State<LoginScreen> {
         _passwordController!.text.trim(),
       );
     } else {
-      if (_ticketController!.text.trim().isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Please enter your ticket number")),
-        );
-        return;
-      }
-      success = await authService.loginPassenger(
-        _ticketController!.text.trim(),
-      );
+      // Passenger handled in RouteSelectionScreen now
+      return;
     }
 
     if (success && mounted) {
-      // Navigate back to the AuthWrapper, which will automatically redirect to the appropriate screen
       Navigator.of(context).pushNamedAndRemoveUntil(
         '/auth', 
-        (route) => false, // Remove all previous routes
+        (route) => false,
       );
     } else if (!success && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -116,16 +115,10 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 16),
                       Text(
-                        widget.userType == UserType.driver
-                            ? "Driver Login"
-                            : "Passenger Login",
-                        style: const TextStyle(
-                          fontSize: 24,
-                          fontWeight: FontWeight.bold,
-                        ),
+                        widget.userType == UserType.driver ? 'Driver Login' : 'Passenger Login',
+                        style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                       ),
-                      const SizedBox(height: 32),
-                      
+                      const SizedBox(height: 24),
                       if (widget.userType == UserType.driver) ...[
                         TextField(
                           controller: _emailController,
@@ -147,16 +140,7 @@ class _LoginScreenState extends State<LoginScreen> {
                           ),
                         ),
                       ] else ...[
-                        TextField(
-                          controller: _ticketController,
-                          decoration: const InputDecoration(
-                            labelText: "Ticket Number",
-                            prefixIcon: Icon(Icons.confirmation_number),
-                            border: OutlineInputBorder(),
-                            hintText: "TKT-XXXXXXXX-XXXX",
-                          ),
-                          textCapitalization: TextCapitalization.characters,
-                        ),
+                        const Text('Redirecting to route selection...'),
                       ],
                       
                       const SizedBox(height: 24),

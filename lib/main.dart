@@ -9,7 +9,7 @@ import 'user_type.dart';
 import 'login_screen.dart';
 import 'driver_screen.dart';
 import 'passenger_screen.dart';
-import 'passengerCount_service.dart';
+import 'route_selection_screen.dart'; 
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -29,7 +29,6 @@ class SafeCommuteApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthService()),
         ChangeNotifierProvider(create: (_) => MonitoringService()),
         ChangeNotifierProvider(create: (_) => LocationService()),
-        ChangeNotifierProvider(create: (_) => PassengerCountService()),
       ],
       child: MaterialApp(
         title: 'SafeCommute',
@@ -37,14 +36,12 @@ class SafeCommuteApp extends StatelessWidget {
           primarySwatch: Colors.blue,
           visualDensity: VisualDensity.adaptivePlatformDensity,
         ),
-        home: const AuthWrapper(), // Keep home property
+        home: const AuthWrapper(),
         routes: {
-          '/auth': (context) =>
-              const AuthWrapper(), // Add this for navigation after login
-          '/driver-login': (context) =>
-              const LoginScreen(userType: UserType.driver),
-          '/passenger-login': (context) =>
-              const LoginScreen(userType: UserType.passenger),
+          '/auth': (context) => const AuthWrapper(),
+          '/driver-login': (context) => const LoginScreen(userType: UserType.driver),
+          '/passenger-login': (context) => const LoginScreen(userType: UserType.passenger),
+          '/route-selection': (context) => const RouteSelectionScreen(), // New route
         },
         debugShowCheckedModeBanner: false,
       ),
@@ -160,10 +157,10 @@ class UserTypeSelector extends StatelessWidget {
                       height: 60,
                       child: ElevatedButton.icon(
                         onPressed: () =>
-                            Navigator.pushNamed(context, '/passenger-login'),
+                            Navigator.pushNamed(context, '/route-selection'), // Updated to route selection
                         icon: const Icon(Icons.person, size: 24),
                         label: const Text(
-                          'Passenger Login',
+                          'Passenger Booking',
                           style: TextStyle(fontSize: 18),
                         ),
                         style: ElevatedButton.styleFrom(

@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'auth_service.dart';
 import 'monitoring_service.dart';
-//import 'location_service.dart';
+import 'location_service.dart';
+import 'passenger_map_widget.dart';
+import 'dart:async';
 
 class PassengerScreen extends StatefulWidget {
   const PassengerScreen({super.key});
@@ -12,427 +16,357 @@ class PassengerScreen extends StatefulWidget {
 }
 
 class _PassengerScreenState extends State<PassengerScreen> {
+  Timer? _locationUpdateTimer;
+  final _complaintController = TextEditingController();
+  bool _isSubmittingComplaint = false;
+  String? _complaintError;
+  bool _complaintSubmitted = false;
+  bool _showMapView = true;
+
   @override
   void initState() {
     super.initState();
-    // Start monitoring all drivers for passenger safety info
-    context.read<MonitoringService>().startMonitoringAllDrivers();
+    final auth = context.read<AuthService>();
+    final monitoring = context.read<MonitoringService>();
+    final location = context.read<LocationService>();
+
+    // Start monitoring specific bus if available
+    if (auth.currentUser?.busNumber != null) {
+      monitoring.startMonitoringSpecificDriver(auth.currentUser!.busNumber!);
+    } else {
+      monitoring.startMonitoringAllDrivers(); // Fallback
+    }
+
+    // Start passenger location tracking
+    _startPassengerLocationTracking();
   }
 
-  Future<void> _logout() async {
-    await context.read<AuthService>().logout();
-    if (mounted) {
-      Navigator.of(context).pushReplacementNamed('/');
+  void _startPassengerLocationTracking() async {
+    final locationService = context.read<LocationService>();
+    final auth = context.read<AuthService>();
+
+    if (auth.currentUser != null) {
+      bool locationStarted = await locationService.startLocationTracking(
+        onLocationUpdate: (Position position) {
+          _updatePassengerLocation(position);
+        },
+      );
+
+      if (locationStarted) {
+        debugPrint("Passenger location tracking started successfully");
+        _locationUpdateTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+          final position = await locationService.getCurrentLocation();
+          if (position != null) {
+            _updatePassengerLocation(position);
+          }
+        });
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location permissions required for safety features'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
     }
   }
 
-  Color _getAlertColor(DriverAlertLevel alertLevel) {
-    switch (alertLevel) {
-      case DriverAlertLevel.none:
-        return Colors.green;
-      case DriverAlertLevel.mild:
-        return Colors.yellow;
-      case DriverAlertLevel.moderate:
-        return Colors.orange;
-      case DriverAlertLevel.severe:
-        return Colors.red;
+  Future<void> _updatePassengerLocation(Position position) async {
+    final auth = context.read<AuthService>();
+    if (auth.currentUser == null) return;
+
+    try {
+      await FirebaseFirestore.instance
+          .collection('passenger_locations')
+          .doc(auth.currentUser!.id)
+          .set({
+        'passengerId': auth.currentUser!.id,
+        'ticketNumber': auth.currentUser!.ticketNumber,
+        'busNumber': auth.currentUser!.busNumber, // Link to bus
+        'location': {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'timestamp': FieldValue.serverTimestamp(),
+          'accuracy': position.accuracy,
+          'speed': position.speed,
+        },
+        'lastUpdate': FieldValue.serverTimestamp(),
+        'isActive': true,
+        'companyId': 'COMPANY_001',
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('Error updating passenger location: $e');
     }
   }
 
-  String _getAlertText(DriverAlertLevel alertLevel) {
-    switch (alertLevel) {
-      case DriverAlertLevel.none:
-        return 'Driver Alert';
-      case DriverAlertLevel.mild:
-        return 'Driver Slightly Tired';
-      case DriverAlertLevel.moderate:
-        return 'Driver Moderately Tired';
-      case DriverAlertLevel.severe:
-        return 'Driver Very Tired - Caution!';
+  void _centerMapOnMyLocation() async {
+    final locationService = context.read<LocationService>();
+    final position = await locationService.getCurrentLocation();
+    
+    if (position == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Unable to get location')));
+      return;
     }
+
+    // Animate map to user location (implement via map controller if using flutter_map)
+    debugPrint('Centering map on: ${position.latitude}, ${position.longitude}');
+  }
+
+  Future<void> _submitComplaint() async {
+    if (_complaintController.text.trim().isEmpty) {
+      setState(() => _complaintError = 'Complaint cannot be empty');
+      return;
+    }
+
+    setState(() {
+      _isSubmittingComplaint = true;
+      _complaintError = null;
+    });
+
+    final auth = context.read<AuthService>();
+    try {
+      await FirebaseFirestore.instance.collection('complaints').add({
+        'name': auth.currentUser?.email ?? 'Anonymous',
+        'ticketNumber': auth.currentUser?.ticketNumber,
+        'busNumber': auth.currentUser?.busNumber,
+        'complaint': _complaintController.text.trim(),
+        'status': 'pending',
+        'source': 'mobile',
+        'companyId': 'COMPANY_001',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      setState(() {
+        _complaintSubmitted = true;
+        _complaintController.clear();
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Complaint submitted successfully'), backgroundColor: Colors.green),
+      );
+    } catch (e) {
+      setState(() => _complaintError = 'Failed to submit: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Submission failed: $e'), backgroundColor: Colors.red),
+      );
+    } finally {
+      setState(() => _isSubmittingComplaint = false);
+    }
+  }
+
+  void _showComplaintDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.warning, color: Colors.orange),
+              SizedBox(width: 8),
+              Text('Report Issue'),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: _complaintController,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  hintText: 'Describe the issue (e.g., driver behavior, comfort)...',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              if (_complaintError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(_complaintError!, style: const TextStyle(color: Colors.red)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _complaintController.clear();
+                setState(() {
+                  _complaintError = null;
+                  _complaintSubmitted = false;
+                });
+              },
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: _isSubmittingComplaint ? null : () async {
+                await _submitComplaint();
+                if (_complaintSubmitted) {
+                  Navigator.of(context).pop();
+                  setState(() {
+                    _complaintError = null;
+                    _complaintSubmitted = false;
+                  });
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                foregroundColor: Colors.white,
+              ),
+              child: _isSubmittingComplaint
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Text('Submit'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showEmergencyDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.emergency, color: Colors.red),
+            SizedBox(width: 8),
+            Text('Emergency Contacts'),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'In case of emergency, contact:',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 12),
+            Text('🚨 Emergency Services: 191 (Ghana Police)'),
+            SizedBox(height: 8),
+            Text('🚌 Transport Authority: +233-302-221-xxx'),
+            SizedBox(height: 8),
+            Text('👮 Police: 191'),
+            SizedBox(height: 16),
+            Text(
+              'Your location is tracked and shared with authorities if needed.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              // TODO: Integrate phone call
+              Navigator.of(context).pop();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Calling emergency services...'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Call 191'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _locationUpdateTimer?.cancel();
+    _complaintController.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final auth = Provider.of<AuthService>(context);
+    final location = Provider.of<LocationService>(context);
+    final monitoring = Provider.of<MonitoringService>(context);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Passenger Mode'),
-        backgroundColor: Colors.green,
-        foregroundColor: Colors.white,
+        title: Text('Passenger Dashboard - ${auth.currentUser?.routeName ?? 'Your Trip'}'),
         actions: [
-          Consumer<AuthService>(
-            builder: (context, auth, _) {
-              return PopupMenuButton<String>(
-                onSelected: (value) {
-                  if (value == 'logout') {
-                    _logout();
-                  }
-                },
-                itemBuilder: (context) => [
-                  PopupMenuItem(
-                    value: 'info',
-                    child: ListTile(
-                      leading: const Icon(Icons.confirmation_number),
-                      title: const Text('Passenger'),
-                      subtitle: Text('Ticket: ${auth.currentUser?.ticketNumber ?? 'Unknown'}'),
-                    ),
-                  ),
-                  const PopupMenuItem(
-                    value: 'logout',
-                    child: ListTile(
-                      leading: Icon(Icons.logout),
-                      title: Text('Logout'),
-                    ),
-                  ),
-                ],
-              );
-            },
+          IconButton(
+            icon: const Icon(Icons.warning),
+            onPressed: _showComplaintDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.emergency),
+            onPressed: _showEmergencyDialog,
+            color: Colors.red,
           ),
         ],
       ),
-      body: Consumer<MonitoringService>(
-        builder: (context, monitoring, _) {
-          // Find current bus driver (this would need to be enhanced with route matching)
-          final currentDriver = monitoring.allDrivers.isNotEmpty 
-              ? monitoring.allDrivers.first 
-              : null;
-
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Welcome card
-                Card(
-                  elevation: 4,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      children: [
-                        Icon(
-                          Icons.person_outline,
-                          size: 48,
-                          color: Colors.green[600],
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Welcome Passenger!',
-                          style: TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Consumer<AuthService>(
-                          builder: (context, auth, _) {
-                            return Text(
-                              'Ticket: ${auth.currentUser?.ticketNumber ?? 'Unknown'}',
-                              style: TextStyle(
-                                color: Colors.grey[600],
-                                fontSize: 16,
-                              ),
-                            );
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                
-                const SizedBox(height: 20),
-
-                // Current trip status
-                const Text(
-                  'Current Trip Status',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 12),
-
-                if (currentDriver != null) ...[
-                  // Driver status card
-                  Card(
-                    elevation: 4,
-                    color: _getAlertColor(currentDriver.alertLevel).withOpacity(0.1),
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Icon(
-                                Icons.drive_eta,
-                                color: _getAlertColor(currentDriver.alertLevel),
-                                size: 24,
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Bus ${currentDriver.busNumber}',
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                    Text(
-                                      _getAlertText(currentDriver.alertLevel),
-                                      style: TextStyle(
-                                        color: _getAlertColor(currentDriver.alertLevel),
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 6,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: currentDriver.isOnline ? Colors.green : Colors.red,
-                                  borderRadius: BorderRadius.circular(20),
-                                ),
-                                child: Text(
-                                  currentDriver.isOnline ? 'Online' : 'Offline',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          
-                          if (currentDriver.location != null) ...[
-                            const SizedBox(height: 16),
-                            Row(
-                              children: [
-                                const Icon(Icons.location_on, size: 16, color: Colors.grey),
-                                const SizedBox(width: 4),
-                                Text(
-                                  'Speed: ${(currentDriver.location!.speed * 3.6).toStringAsFixed(1)} km/h',
-                                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                ),
-                                const SizedBox(width: 16),
-                                const Icon(Icons.access_time, size: 16, color: Colors.grey),
-                                const SizedBox(width: 4),
-                                Text(
-                                  'Updated: ${_formatTime(currentDriver.lastUpdate)}',
-                                  style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                ),
-                              ],
-                            ),
-                          ],
-
-                          if (currentDriver.alertLevel != DriverAlertLevel.none) ...[
-                            const SizedBox(height: 16),
-                            Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: _getAlertColor(currentDriver.alertLevel).withOpacity(0.2),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: _getAlertColor(currentDriver.alertLevel),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    Icons.warning,
-                                    color: _getAlertColor(currentDriver.alertLevel),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      currentDriver.alertLevel == DriverAlertLevel.severe
-                                          ? 'Driver is showing signs of severe fatigue. Please remain alert and consider notifying transport authorities if concerned.'
-                                          : 'Driver is showing mild signs of fatigue but is still safe to drive.',
-                                      style: TextStyle(
-                                        color: _getAlertColor(currentDriver.alertLevel),
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                    ),
-                  ),
-                ] else ...[
-                  Card(
-                    elevation: 4,
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        children: [
-                          Icon(
-                            Icons.info_outline,
-                            size: 48,
-                            color: Colors.orange[600],
-                          ),
-                          const SizedBox(height: 12),
-                          const Text(
-                            'No Active Driver Found',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Unable to locate your driver at the moment. Please ensure you are on the correct vehicle.',
-                            style: TextStyle(color: Colors.grey[600]),
-                            textAlign: TextAlign.center,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+      body: Column(
+        children: [
+          // Trip Info Card
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  Text('Bus: ${auth.currentUser?.busNumber ?? 'TBA'}'),
+                  Text('Route: ${auth.currentUser?.routeName ?? ''}'),
+                  Text('From: ${auth.currentUser?.origin ?? ''} to ${auth.currentUser?.destination ?? ''}'),
+                  if (auth.currentUser?.ticketNumber != null) Text('Ticket: ${auth.currentUser!.ticketNumber}'),
                 ],
-
-                const SizedBox(height: 20),
-
-                // Safety features
-                const Text(
-                  'Safety Features',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 12),
-
-                _buildSafetyFeatureCard(
-                  'Drowsiness Detection',
-                  'Monitors driver alertness in real-time',
-                  Icons.remove_red_eye,
-                  Colors.blue,
-                ),
-                const SizedBox(height: 12),
-
-                _buildSafetyFeatureCard(
-                  'Location Tracking',
-                  'Tracks vehicle location for safety',
-                  Icons.location_on,
-                  Colors.green,
-                ),
-                const SizedBox(height: 12),
-
-                _buildSafetyFeatureCard(
-                  'HQ Monitoring',
-                  'Transport headquarters monitors this trip',
-                  Icons.security,
-                  Colors.purple,
-                ),
-
-                const SizedBox(height: 20),
-
-                // Emergency contact (placeholder)
-                Card(
-                  elevation: 4,
-                  color: Colors.red[50],
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      children: [
-                        Icon(
-                          Icons.emergency,
-                          size: 48,
-                          color: Colors.red[600],
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Emergency Contact',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'In case of emergency, contact:\nTransport Authority: +233-XXX-XXXX',
-                          style: TextStyle(color: Colors.grey[700]),
-                          textAlign: TextAlign.center,
-                        ),
-                        const SizedBox(height: 12),
-                        ElevatedButton.icon(
-                          onPressed: () {
-                            // Implement emergency contact functionality
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Emergency contact feature coming soon'),
-                              ),
-                            );
-                          },
-                          icon: const Icon(Icons.phone),
-                          label: const Text('Call Emergency'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.red,
-                            foregroundColor: Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+              ),
             ),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildSafetyFeatureCard(String title, String description, IconData icon, Color color) {
-    return Card(
-      elevation: 2,
-      child: ListTile(
-        leading: Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(8),
           ),
-          child: Icon(icon, color: color),
-        ),
-        title: Text(
-          title,
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
-        subtitle: Text(description),
-        trailing: Icon(
-          Icons.check_circle,
-          color: Colors.green[600],
-          size: 20,
-        ),
+          Expanded(
+            child: Consumer2<LocationService, MonitoringService>(
+              builder: (context, location, monitoring, child) {
+                return Stack(
+                  children: [
+                    PassengerMapWidget(
+                      passengerLocation: location.currentPosition,
+                      driverStatus: monitoring.currentDriverStatus,
+                      onMyLocationPressed: _centerMapOnMyLocation,
+                    ),
+                    if (location.errorMessage != null)
+                      Positioned(
+                        top: 10,
+                        left: 10,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: Colors.red.withOpacity(0.8),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            location.errorMessage!,
+                            style: const TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _centerMapOnMyLocation,
+        child: const Icon(Icons.my_location),
       ),
     );
-  }
-
-  String _formatTime(DateTime dateTime) {
-    final now = DateTime.now();
-    final difference = now.difference(dateTime);
-
-    if (difference.inMinutes < 1) {
-      return 'Just now';
-    } else if (difference.inMinutes < 60) {
-      return '${difference.inMinutes}m ago';
-    } else if (difference.inHours < 24) {
-      return '${difference.inHours}h ago';
-    } else {
-      return '${dateTime.day}/${dateTime.month} ${dateTime.hour}:${dateTime.minute.toString().padLeft(2, '0')}';
-    }
   }
 }
