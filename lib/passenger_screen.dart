@@ -128,14 +128,21 @@ class _PassengerScreenState extends State<PassengerScreen> {
     final auth = context.read<AuthService>();
     try {
       await FirebaseFirestore.instance.collection('complaints').add({
-        'name': auth.currentUser?.email ?? 'Anonymous',
+        // FIXED: Use actual passenger name instead of generated email
+        'name': auth.currentUser?.passengerName ?? 'Anonymous Passenger',
         'ticketNumber': auth.currentUser?.ticketNumber,
         'busNumber': auth.currentUser?.busNumber,
+        'routeName': auth.currentUser?.routeName,
+        'phoneNumber': auth.currentUser?.phoneNumber, // Add phone for better identification
         'complaint': _complaintController.text.trim(),
         'status': 'pending',
         'source': 'mobile',
         'companyId': 'COMPANY_001',
         'createdAt': FieldValue.serverTimestamp(),
+        // Additional context for better complaint tracking
+        'passengerEmail': auth.currentUser?.email, // Keep the generated email for reference
+        'origin': auth.currentUser?.origin,
+        'destination': auth.currentUser?.destination,
       });
 
       setState(() {
@@ -171,6 +178,29 @@ class _PassengerScreenState extends State<PassengerScreen> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // Show passenger info for context
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.blue.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Reporting as: ${context.read<AuthService>().currentUser?.passengerName ?? 'Anonymous'}',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    if (context.read<AuthService>().currentUser?.ticketNumber != null)
+                      Text('Ticket: ${context.read<AuthService>().currentUser!.ticketNumber}'),
+                    if (context.read<AuthService>().currentUser?.busNumber != null)
+                      Text('Bus: ${context.read<AuthService>().currentUser!.busNumber}'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
               TextField(
                 controller: _complaintController,
                 maxLines: 4,
@@ -286,6 +316,184 @@ class _PassengerScreenState extends State<PassengerScreen> {
     );
   }
 
+  void _showTicketInfoDialog() {
+    final auth = context.read<AuthService>();
+    final user = auth.currentUser;
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.confirmation_number, color: Colors.green),
+            SizedBox(width: 8),
+            Text('Your Ticket'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (user?.passengerName != null) ...[
+              Text('Passenger: ${user!.passengerName}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+            ],
+            if (user?.ticketNumber != null) ...[
+              Text('Ticket: ${user!.ticketNumber}'),
+              const SizedBox(height: 8),
+            ],
+            if (user?.phoneNumber != null) ...[
+              Text('Phone: ${user!.phoneNumber}'),
+              const SizedBox(height: 8),
+            ],
+            if (user?.routeName != null) ...[
+              Text('Route: ${user!.routeName}'),
+              const SizedBox(height: 8),
+            ],
+            if (user?.origin != null && user?.destination != null) ...[
+              Text('${user!.origin} → ${user.destination}'),
+              const SizedBox(height: 8),
+            ],
+            if (user?.busNumber != null) ...[
+              Text('Bus: ${user!.busNumber}'),
+              const SizedBox(height: 8),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showLogoutDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.logout, color: Colors.red),
+            SizedBox(width: 8),
+            Text('Confirm Logout'),
+          ],
+        ),
+        content: const Text(
+          'Are you sure you want to logout? Your trip tracking will stop.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.of(context).pop(); // Close dialog
+              await _performLogout();
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Logout'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _performLogout() async {
+    try {
+      // Show loading indicator
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const Center(
+          child: Card(
+            child: Padding(
+              padding: EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Logging out...'),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+
+      final auth = context.read<AuthService>();
+      final locationService = context.read<LocationService>();
+      final monitoring = context.read<MonitoringService>();
+
+      // Stop location tracking
+      locationService.stopLocationTracking();
+      _locationUpdateTimer?.cancel();
+
+      // Stop monitoring services
+      if (auth.currentUser?.busNumber != null) {
+        monitoring.stopMonitoring(auth.currentUser!.busNumber!);
+      } else {
+        // If no specific bus, try to stop general monitoring
+        try {
+          monitoring.stopMonitoring('');
+        } catch (e) {
+          debugPrint('Error stopping monitoring: $e');
+        }
+      }
+
+      // Clean up passenger location from database
+      if (auth.currentUser != null) {
+        try {
+          await FirebaseFirestore.instance
+              .collection('passenger_locations')
+              .doc(auth.currentUser!.id)
+              .update({
+            'isActive': false,
+            'lastUpdate': FieldValue.serverTimestamp(),
+          });
+        } catch (e) {
+          debugPrint('Error updating passenger status on logout: $e');
+        }
+      }
+
+      // Perform logout
+      await auth.logout();
+
+      // Navigate back to login selection
+      if (mounted) {
+        Navigator.of(context).pop(); // Close loading dialog
+        Navigator.of(context).pushNamedAndRemoveUntil(
+          '/', 
+          (route) => false,
+        );
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Logged out successfully'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.of(context).pop(); // Close loading dialog
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Logout failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   @override
   void dispose() {
     _locationUpdateTimer?.cancel();
@@ -301,35 +509,139 @@ class _PassengerScreenState extends State<PassengerScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Passenger Dashboard - ${auth.currentUser?.routeName ?? 'Your Trip'}'),
+        title: Text('${auth.currentUser?.passengerName ?? 'Passenger'} - ${auth.currentUser?.routeName ?? 'Your Trip'}'),
+        backgroundColor: Colors.green,
+        foregroundColor: Colors.white,
         actions: [
+          // Ticket info button
+          IconButton(
+            icon: const Icon(Icons.confirmation_number),
+            onPressed: _showTicketInfoDialog,
+            tooltip: 'View Ticket Details',
+          ),
           IconButton(
             icon: const Icon(Icons.warning),
             onPressed: _showComplaintDialog,
+            tooltip: 'Report Issue',
           ),
           IconButton(
             icon: const Icon(Icons.emergency),
             onPressed: _showEmergencyDialog,
             color: Colors.red,
+            tooltip: 'Emergency',
+          ),
+          // NEW: Logout button
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (String value) {
+              if (value == 'logout') {
+                _showLogoutDialog();
+              }
+            },
+            itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+              const PopupMenuItem<String>(
+                value: 'logout',
+                child: Row(
+                  children: [
+                    Icon(Icons.logout, color: Colors.red),
+                    SizedBox(width: 8),
+                    Text('Logout'),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
       ),
       body: Column(
         children: [
-          // Trip Info Card
+          // Enhanced Trip Info Card
           Card(
+            margin: const EdgeInsets.all(8.0),
             child: Padding(
               padding: const EdgeInsets.all(16.0),
               child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Bus: ${auth.currentUser?.busNumber ?? 'TBA'}'),
-                  Text('Route: ${auth.currentUser?.routeName ?? ''}'),
-                  Text('From: ${auth.currentUser?.origin ?? ''} to ${auth.currentUser?.destination ?? ''}'),
-                  if (auth.currentUser?.ticketNumber != null) Text('Ticket: ${auth.currentUser!.ticketNumber}'),
+                  // Passenger info row
+                  if (auth.currentUser?.passengerName != null)
+                    Row(
+                      children: [
+                        const Icon(Icons.person, size: 20, color: Colors.green),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Welcome, ${auth.currentUser!.passengerName}',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.green,
+                          ),
+                        ),
+                      ],
+                    ),
+                  const SizedBox(height: 12),
+                  
+                  // Trip details
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (auth.currentUser?.busNumber != null)
+                              Row(
+                                children: [
+                                  const Icon(Icons.directions_bus, size: 16, color: Colors.grey),
+                                  const SizedBox(width: 4),
+                                  Text('Bus: ${auth.currentUser!.busNumber}'),
+                                ],
+                              ),
+                            const SizedBox(height: 4),
+                            if (auth.currentUser?.routeName != null)
+                              Row(
+                                children: [
+                                  const Icon(Icons.route, size: 16, color: Colors.grey),
+                                  const SizedBox(width: 4),
+                                  Expanded(child: Text('Route: ${auth.currentUser!.routeName}')),
+                                ],
+                              ),
+                            const SizedBox(height: 4),
+                            if (auth.currentUser?.origin != null && auth.currentUser?.destination != null)
+                              Row(
+                                children: [
+                                  const Icon(Icons.location_on, size: 16, color: Colors.grey),
+                                  const SizedBox(width: 4),
+                                  Expanded(child: Text('${auth.currentUser!.origin} → ${auth.currentUser!.destination}')),
+                                ],
+                              ),
+                          ],
+                        ),
+                      ),
+                      if (auth.currentUser?.ticketNumber != null)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.green.shade100,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.green.shade300),
+                          ),
+                          child: Text(
+                            auth.currentUser!.ticketNumber!,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.green.shade700,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ],
               ),
             ),
           ),
+          
+          // Map section
           Expanded(
             child: Consumer2<LocationService, MonitoringService>(
               builder: (context, location, monitoring, child) {
@@ -363,9 +675,25 @@ class _PassengerScreenState extends State<PassengerScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _centerMapOnMyLocation,
-        child: const Icon(Icons.my_location),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          // Emergency FAB
+          FloatingActionButton(
+            heroTag: "emergency",
+            onPressed: _showEmergencyDialog,
+            backgroundColor: Colors.red,
+            child: const Icon(Icons.emergency, color: Colors.white),
+          ),
+          const SizedBox(height: 16),
+          // Location FAB
+          FloatingActionButton(
+            heroTag: "location",
+            onPressed: _centerMapOnMyLocation,
+            backgroundColor: Colors.green,
+            child: const Icon(Icons.my_location, color: Colors.white),
+          ),
+        ],
       ),
     );
   }

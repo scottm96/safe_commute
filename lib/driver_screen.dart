@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:vibration/vibration.dart';
 import 'package:flutter/material.dart';
@@ -9,7 +8,6 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:provider/provider.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'auth_service.dart';
 import 'monitoring_service.dart';
 import 'location_service.dart';
@@ -34,16 +32,25 @@ class _DriverScreenState extends State<DriverScreen>
   bool _alertTriggered = false;
   final AudioPlayer _audioPlayer = AudioPlayer();
   Timer? _alertEscalationTimer;
-  //Timer? _autoStopTimer;
+  Timer? _autoStopTimer;
   Timer? _locationUpdateTimer;
-  String? _currentScheduleId;
+  Timer? _statusUpdateTimer;
 
- /* final _orientations = {
+  // NEW: Alert tracking for passenger notifications
+  int _alertCount = 0;
+  DateTime? _firstAlertTime;
+  DateTime? _secondAlertTime;
+
+  final _orientations = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
     DeviceOrientation.portraitDown: 180,
     DeviceOrientation.landscapeRight: 270,
-  };*/
+  };
+
+  DriverStatus? _localDriverStatus;
+  String? _driverId;
+  String? _busNumber;
 
   @override
   bool get wantKeepAlive => true;
@@ -57,7 +64,6 @@ class _DriverScreenState extends State<DriverScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initializeCamera();
       _startLocationTracking();
-      _checkForAssignedSchedule();
     });
   }
 
@@ -74,6 +80,10 @@ class _DriverScreenState extends State<DriverScreen>
     } else if (state == AppLifecycleState.resumed) {
       if (!_cameraInitialized) {
         _initializeCamera();
+      }
+      final monitoringService = context.read<MonitoringService>();
+      if (_driverId != null && _busNumber != null) {
+        monitoringService.startMonitoringSpecificDriver(_busNumber!);
       }
     }
   }
@@ -102,328 +112,913 @@ class _DriverScreenState extends State<DriverScreen>
         orElse: () => cameras!.first,
       );
 
-      _controller = CameraController(frontCamera, ResolutionPreset.medium);
+      _controller = CameraController(
+        frontCamera,
+        ResolutionPreset.medium,
+        imageFormatGroup: Platform.isAndroid 
+            ? ImageFormatGroup.yuv420 
+            : ImageFormatGroup.bgra8888,
+        enableAudio: false,
+      );
+      
       await _controller!.initialize();
       _cameraInitialized = true;
-      if (mounted) setState(() {});
-      debugPrint("Camera initialized successfully");
+      
+      if (mounted) {
+        setState(() {});
+        debugPrint("Camera initialized successfully");
+      }
     } catch (e) {
-      debugPrint("Error initializing camera: $e");
+      debugPrint("Camera initialization error: $e");
+      _cameraInitialized = false;
+      Timer(const Duration(seconds: 2), () {
+        if (mounted && !_cameraInitialized) {
+          _initializeCamera();
+        }
+      });
+    }
+  }
+
+  void _startLocationTracking() async {
+    final locationService = context.read<LocationService>();
+    final monitoringService = context.read<MonitoringService>();
+    final auth = context.read<AuthService>();
+
+    if (auth.currentUser != null) {
+      _driverId = auth.currentUser!.id;
+      _busNumber = auth.currentUser!.busNumber ?? 'Unknown';
+
+      _localDriverStatus = DriverStatus(
+        driverId: _driverId!,
+        busNumber: _busNumber!,
+        alertLevel: DriverAlertLevel.none,
+        lastUpdate: DateTime.now(),
+        isDrowsy: false,
+        closedEyeFrames: 0,
+        isOnline: true,
+      );
+
+      await monitoringService.startMonitoringSpecificDriver(_busNumber!);
+
+      bool locationStarted = await locationService.startLocationTracking(
+        onLocationUpdate: (Position position) {
+          if (_localDriverStatus != null) {
+            _localDriverStatus = DriverStatus(
+              driverId: _driverId!,
+              busNumber: _busNumber!,
+              location: position,
+              alertLevel: _localDriverStatus!.alertLevel,
+              lastUpdate: DateTime.now(),
+              isDrowsy: _localDriverStatus!.isDrowsy,
+              closedEyeFrames: _localDriverStatus!.closedEyeFrames,
+              isOnline: true,
+            );
+            monitoringService.updateDriverStatus(_localDriverStatus!);
+          }
+        },
+      );
+
+      if (locationStarted) {
+        debugPrint("Location tracking started successfully");
+        _statusUpdateTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+          if (_localDriverStatus != null) {
+            final position = await locationService.getCurrentLocation();
+            if (position != null) {
+              _localDriverStatus = DriverStatus(
+                driverId: _driverId!,
+                busNumber: _busNumber!,
+                location: position,
+                alertLevel: _localDriverStatus!.alertLevel,
+                lastUpdate: DateTime.now(),
+                isDrowsy: _localDriverStatus!.isDrowsy,
+                closedEyeFrames: _localDriverStatus!.closedEyeFrames,
+                isOnline: true,
+              );
+              monitoringService.updateDriverStatus(_localDriverStatus!);
+            }
+          }
+        });
+      } else {
+        debugPrint("Failed to start location tracking");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location permissions required for monitoring'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
     }
   }
 
   void _startDetection() {
-    if (!_cameraInitialized || _isStreamingImages) return;
+    if (_controller == null || !_controller!.value.isInitialized || !_cameraInitialized) {
+      debugPrint("Camera not ready for detection");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Camera not ready. Please wait.')),
+      );
+      return;
+    }
 
+    if (_isDetecting || _isStreamingImages) {
+      debugPrint("Detection already running");
+      return;
+    }
+
+    _isDetecting = true;
     _isStreamingImages = true;
-    _closedEyeFrames = 0;
-    _alertTriggered = false;
-    _eyeClosureTimer?.cancel();
 
-    _processImageStream();
-    setState(() {});
+    try {
+      _controller!.startImageStream((CameraImage image) {
+        if (!_isDetecting || !mounted) return;
+
+        if (_isDetecting) {
+          _isDetecting = false;
+          _processCameraImage(image).then((_) {
+            if (mounted) _isDetecting = true;
+          }).catchError((error) {
+            debugPrint("Error processing image: $error");
+            if (mounted) _isDetecting = true;
+          });
+        }
+      });
+      debugPrint("Image stream started successfully");
+    } catch (e) {
+      debugPrint("Error starting image stream: $e");
+      _isDetecting = false;
+      _isStreamingImages = false;
+    }
+
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   void _stopDetection() {
-    _isStreamingImages = false;
+    debugPrint("Stopping detection...");
+
+    _isDetecting = false;
+    _closedEyeFrames = 0;
+    _alertTriggered = false;
+    // NEW: Reset alert tracking
+    _alertCount = 0;
+    _firstAlertTime = null;
+    _secondAlertTime = null;
+    
     _eyeClosureTimer?.cancel();
-    _alertEscalationTimer?.cancel();
-    _audioPlayer.stop();
-    Vibration.cancel();
-    setState(() {});
+    _stopAlert();
+
+    if (_isStreamingImages &&
+        _controller != null &&
+        _controller!.value.isInitialized &&
+        _controller!.value.isStreamingImages) {
+      try {
+        _controller!.stopImageStream();
+        debugPrint("Image stream stopped successfully");
+      } catch (e) {
+        debugPrint("Error stopping image stream: $e");
+      }
+    }
+
+    _isStreamingImages = false;
+
+    if (mounted) {
+      setState(() {});
+    }
   }
 
-  void _processImageStream() async {
-    if (!_controller!.value.isInitialized) return;
-
-    final image = await _controller!.takePicture();
-    final inputImage = InputImage.fromFilePath(image.path);
+  Future<void> _processCameraImage(CameraImage image) async {
+    final inputImage = _getInputImageFromCameraImage(image, _controller!);
+    if (inputImage == null) {
+      return;
+    }
 
     try {
       final faces = await _faceDetector.processImage(inputImage);
       if (faces.isNotEmpty) {
         final face = faces.first;
-        final eyeOpenProbability = face.smilingProbability ?? 0.0;
+        if (face.leftEyeOpenProbability != null &&
+            face.rightEyeOpenProbability != null) {
+          final leftEyeOpen = face.leftEyeOpenProbability!;
+          final rightEyeOpen = face.rightEyeOpenProbability!;
 
-        if (eyeOpenProbability < 0.3) {
-          _closedEyeFrames++;
-          _eyeClosureTimer ??= Timer(const Duration(seconds: 3), () {
-            if (_closedEyeFrames >= 90) { // ~3 seconds at 30fps
-              _triggerAlert();
+          bool isDrowsy = leftEyeOpen < 0.3 && rightEyeOpen < 0.3;
+
+          if (isDrowsy) {
+            _closedEyeFrames++;
+            if (_closedEyeFrames > 15 && !_alertTriggered) {
+              _triggerDrowsinessAlert();
             }
-          });
-        } else {
-          _closedEyeFrames = 0;
-          _eyeClosureTimer?.cancel();
+          } else {
+            _closedEyeFrames = 0;
+          }
+
+          final monitoringService = context.read<MonitoringService>();
+          if (_localDriverStatus != null && _driverId != null) {
+            DriverAlertLevel newAlertLevel = DriverAlertLevel.none;
+            if (_closedEyeFrames > 20) {
+              newAlertLevel = DriverAlertLevel.severe;
+            } else if (_closedEyeFrames > 10) {
+              newAlertLevel = DriverAlertLevel.moderate;
+            } else if (_closedEyeFrames > 5) {
+              newAlertLevel = DriverAlertLevel.mild;
+            }
+
+            _localDriverStatus = DriverStatus(
+              driverId: _driverId!,
+              busNumber: _busNumber!,
+              location: _localDriverStatus!.location,
+              alertLevel: newAlertLevel,
+              lastUpdate: DateTime.now(),
+              isDrowsy: isDrowsy,
+              closedEyeFrames: _closedEyeFrames,
+              isOnline: true,
+            );
+            monitoringService.updateDriverStatus(_localDriverStatus!);
+          }
         }
+      } else {
+        _closedEyeFrames = 0;
       }
     } catch (e) {
-      debugPrint('Face detection error: $e');
-    }
-
-    if (_isStreamingImages) {
-      Future.delayed(const Duration(milliseconds: 33), _processImageStream); // ~30fps
+      debugPrint("Error processing image: $e");
     }
   }
 
-  void _triggerAlert() async {
+  // NEW: Updated drowsiness alert with passenger notification
+  void _triggerDrowsinessAlert() async {
     if (_alertTriggered) return;
     _alertTriggered = true;
+    _alertCount++;
+    
+    // Record alert times
+    if (_alertCount == 1) {
+      _firstAlertTime = DateTime.now();
+    } else if (_alertCount == 2) {
+      _secondAlertTime = DateTime.now();
+      // NEW: Notify passengers after second alert
+      await _notifyPassengersOfDrowsiness();
+    }
+    
+    debugPrint("⚠️ Alert #$_alertCount: Possible Drowsiness Detected!");
 
-    // Play alarm
-    await _audioPlayer.play(AssetSource('sounds/alarm.wav'));
-    Vibration.vibrate(pattern: [500, 1000, 500, 1000]);
+    try {
+      await _audioPlayer.play(AssetSource('sounds/beep.wav'), volume: 0.5);
+      if (await Vibration.hasVibrator()) {
+        Vibration.vibrate(pattern: [0, 300, 150, 300]);
+      }
+    } catch (e) {
+      debugPrint("Error playing gentle alert: $e");
+    }
 
-    // Escalate if not acknowledged
-    _alertEscalationTimer = Timer(const Duration(seconds: 10), () {
-      _escalateAlert();
+    if (mounted) {
+      _showGentleOverlay();
+    }
+
+    _alertEscalationTimer = Timer(const Duration(seconds: 5), () async {
+      if (_alertTriggered && mounted) {
+        debugPrint("⚠️ Escalating Alert: Still no acknowledgment.");
+        try {
+          await _audioPlayer.play(AssetSource('sounds/alarm.wav'), volume: 1.0);
+          if (await Vibration.hasVibrator()) {
+            Vibration.vibrate(pattern: [0, 600, 200, 600, 200, 600]);
+          }
+        } catch (e) {
+          debugPrint("Error playing escalated alert: $e");
+        }
+        _showEscalatedOverlay();
+      }
     });
 
-    // Log incident
-    final monitoring = Provider.of<MonitoringService>(context, listen: false);
-    final auth = Provider.of<AuthService>(context, listen: false);
-    monitoring.logIncident(auth.currentUser!.id, 'DROWSINESS_SEVERE', 'Driver drowsiness detected');
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('ALERT: Eyes closed detected! Please focus on road.'),
-        backgroundColor: Colors.red,
-        duration: Duration(seconds: 5),
-      ),
-    );
-  }
-
-  void _escalateAlert() async {
-    // TODO: Send emergency notification
-    debugPrint('Escalating alert to control center');
-  }
-
-  Future<void> _startLocationTracking() async {
-    final locationService = Provider.of<LocationService>(context, listen: false);
-    await locationService.startLocationTracking(
-      onLocationUpdate: (position) => _updateDriverLocation(position),
-    );
-
-    _locationUpdateTimer = Timer.periodic(const Duration(seconds: 15), (timer) async {
-      final position = await locationService.getCurrentLocation();
-      if (position != null) {
-        _updateDriverLocation(position);
+    _autoStopTimer = Timer(const Duration(seconds: 15), () {
+      if (_alertTriggered && mounted) {
+        _stopAlert();
       }
     });
   }
 
-  Future<void> _updateDriverLocation(Position position) async {
-    final auth = Provider.of<AuthService>(context, listen: false);
-    final monitoring = Provider.of<MonitoringService>(context, listen: false);
-    if (auth.currentUser == null) return;
+  // NEW: Method to notify passengers of driver drowsiness
+  Future<void> _notifyPassengersOfDrowsiness() async {
+    final monitoringService = context.read<MonitoringService>();
+    
+    if (_driverId != null && _busNumber != null) {
+      try {
+        // Log incident for passengers to see
+        await monitoringService.logIncident(
+          _driverId!, 
+          'DROWSINESS_DETECTED', 
+          'Driver drowsiness alert triggered - Alert #$_alertCount at ${DateTime.now().toIso8601String()}'
+        );
 
-    final status = DriverStatus(
-      driverId: auth.currentUser!.id,
-      busNumber: auth.currentUser!.busNumber ?? '',
-      location: position,
-      lastUpdate: DateTime.now(),
-      isDrowsy: _closedEyeFrames > 0,
-      closedEyeFrames: _closedEyeFrames,
-    );
+        // Create a special passenger alert status
+        await monitoringService.createPassengerAlert(
+          busNumber: _busNumber!,
+          alertType: 'DRIVER_DROWSINESS',
+          severity: 'HIGH',
+          message: 'Driver drowsiness detected. Safety monitoring active.',
+          timestamp: DateTime.now(),
+        );
 
-    await monitoring.updateDriverStatus(status);
-  }
-
-  Future<void> _checkForAssignedSchedule() async {
-    final auth = Provider.of<AuthService>(context, listen: false);
-    final query = await FirebaseFirestore.instance
-        .collection('schedules')
-        .where('busNumber', isEqualTo: auth.currentUser!.busNumber)
-        .where('status', isEqualTo: 'scheduled')
-        .where('companyId', isEqualTo: 'COMPANY_001')
-        .limit(1)
-        .get();
-
-    if (query.docs.isNotEmpty) {
-      _currentScheduleId = query.docs.first.id;
-      debugPrint('Assigned schedule found: $_currentScheduleId');
+        debugPrint("📱 Passenger alert sent for bus $_busNumber");
+      } catch (e) {
+        debugPrint("Error notifying passengers: $e");
+      }
     }
   }
 
-  Future<void> _startTrip() async {
-    if (_currentScheduleId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No assigned schedule')));
-      return;
+  void _stopAlert() {
+    _audioPlayer.stop();
+    Vibration.cancel();
+    _alertTriggered = false;
+    _alertEscalationTimer?.cancel();
+    _autoStopTimer?.cancel();
+    if (mounted && Navigator.canPop(context)) {
+      Navigator.of(context, rootNavigator: true).pop();
     }
-
-    final location = await Geolocator.getCurrentPosition();
-    final monitoring = Provider.of<MonitoringService>(context, listen: false);
-    final auth = Provider.of<AuthService>(context, listen: false);
-
-    await monitoring.logTripStart(_currentScheduleId!, auth.currentUser!.id, {
-      'latitude': location.latitude,
-      'longitude': location.longitude,
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Trip started! Departure logged.'), backgroundColor: Colors.green),
-    );
   }
 
-  Future<void> _endTrip() async {
-    if (_currentScheduleId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No active trip')));
-      return;
+  void _showGentleOverlay() {
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        barrierColor: Colors.black.withOpacity(0.3),
+        builder: (ctx) {
+          return AlertDialog(
+            title: Text("Stay Alert - Alert #$_alertCount"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("It seems you may be feeling drowsy. Please take a break."),
+                if (_alertCount >= 2)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8.0),
+                    child: Text(
+                      "⚠️ Passengers have been notified for safety.",
+                      style: TextStyle(
+                        color: Colors.orange,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: _stopAlert,
+                child: const Text("I'm Okay"),
+              ),
+            ],
+          );
+        },
+      );
+    }
+  }
+
+  void _showEscalatedOverlay() {
+    if (mounted && Navigator.canPop(context)) {
+      Navigator.of(context, rootNavigator: true).pop();
+    }
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        barrierColor: Colors.black.withOpacity(0.6),
+        builder: (ctx) {
+          return AlertDialog(
+            title: Text(
+              "⚠️ Warning - Alert #$_alertCount",
+              style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("Please pull over safely and rest before continuing."),
+                if (_alertCount >= 2)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8.0),
+                    child: Text(
+                      "🔔 Passengers are being alerted for their safety.",
+                      style: TextStyle(
+                        color: Colors.red,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: _stopAlert,
+                child: const Text("I Understand"),
+              ),
+            ],
+          );
+        },
+      );
+    }
+  }
+
+  // [Include all the existing helper methods: _getInputImageFromCameraImage, _convertYUV420ToNV21, etc.]
+  InputImage? _getInputImageFromCameraImage(
+    CameraImage image,
+    CameraController controller,
+  ) {
+    try {
+      final camera = controller.description;
+      final sensorOrientation = camera.sensorOrientation;
+
+      InputImageRotation? rotation;
+
+      if (Platform.isIOS) {
+        switch (controller.value.deviceOrientation) {
+          case DeviceOrientation.portraitUp:
+            rotation = camera.lensDirection == CameraLensDirection.front
+                ? InputImageRotation.rotation270deg
+                : InputImageRotation.rotation90deg;
+            break;
+          case DeviceOrientation.portraitDown:
+            rotation = camera.lensDirection == CameraLensDirection.front
+                ? InputImageRotation.rotation90deg
+                : InputImageRotation.rotation270deg;
+            break;
+          case DeviceOrientation.landscapeLeft:
+            rotation = camera.lensDirection == CameraLensDirection.front
+                ? InputImageRotation.rotation180deg
+                : InputImageRotation.rotation0deg;
+            break;
+          case DeviceOrientation.landscapeRight:
+            rotation = camera.lensDirection == CameraLensDirection.front
+                ? InputImageRotation.rotation0deg
+                : InputImageRotation.rotation180deg;
+            break;
+        }
+      } else if (Platform.isAndroid) {
+        var rotationCompensation =
+            _orientations[controller.value.deviceOrientation];
+        if (rotationCompensation == null) return null;
+
+        if (camera.lensDirection == CameraLensDirection.front) {
+          rotationCompensation =
+              (sensorOrientation + rotationCompensation) % 360;
+        } else {
+          rotationCompensation =
+              (sensorOrientation - rotationCompensation + 360) % 360;
+        }
+        rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
+      }
+
+      if (rotation == null) return null;
+
+      final format = InputImageFormatValue.fromRawValue(image.format.raw);
+      if (format == null) return null;
+
+      if (Platform.isIOS) {
+        if (format != InputImageFormat.bgra8888) return null;
+      } else {
+        if (format != InputImageFormat.nv21 &&
+            format != InputImageFormat.yuv420 &&
+            format != InputImageFormat.yuv_420_888) return null;
+      }
+
+      final plane = image.planes.first;
+      Uint8List bytes;
+      InputImageFormat finalFormat = format;
+
+      if (Platform.isAndroid &&
+          (format == InputImageFormat.yuv420 ||
+              format == InputImageFormat.yuv_420_888) &&
+          image.planes.length >= 3) {
+        bytes = _convertYUV420ToNV21(image);
+        finalFormat = InputImageFormat.nv21;
+      } else {
+        final WriteBuffer allBytes = WriteBuffer();
+        for (final plane in image.planes) {
+          allBytes.putUint8List(plane.bytes);
+        }
+        bytes = allBytes.done().buffer.asUint8List();
+      }
+
+      final inputImage = InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: finalFormat,
+          bytesPerRow: plane.bytesPerRow,
+        ),
+      );
+
+      return inputImage;
+    } catch (e) {
+      debugPrint('Error converting camera image: $e');
+      return null;
+    }
+  }
+
+  Uint8List _convertYUV420ToNV21(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+    final int ySize = width * height;
+    final int uvSize = width * height ~/ 4;
+    final Uint8List nv21 = Uint8List(ySize + uvSize * 2);
+
+    final Uint8List yPlane = image.planes[0].bytes;
+    final int yRowStride = image.planes[0].bytesPerRow;
+    final int yPixelStride = image.planes[0].bytesPerPixel ?? 1;
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        nv21[y * width + x] = yPlane[y * yRowStride + x * yPixelStride];
+      }
     }
 
-    final location = await Geolocator.getCurrentPosition();
-    final monitoring = Provider.of<MonitoringService>(context, listen: false);
-    final auth = Provider.of<AuthService>(context, listen: false);
+    final Uint8List uPlane = image.planes[1].bytes;
+    final Uint8List vPlane = image.planes[2].bytes;
+    final int uRowStride = image.planes[1].bytesPerRow;
+    final int vRowStride = image.planes[2].bytesPerRow;
+    final int uPixelStride = image.planes[1].bytesPerPixel ?? 1;
+    final int vPixelStride = image.planes[2].bytesPerPixel ?? 1;
 
-    await monitoring.logTripEnd(_currentScheduleId!, auth.currentUser!.id, {
-      'latitude': location.latitude,
-      'longitude': location.longitude,
-    });
+    int uvIndex = ySize;
+    for (int y = 0; y < height ~/ 2; y++) {
+      for (int x = 0; x < width ~/ 2; x++) {
+        final int uIdx = y * uRowStride + x * uPixelStride;
+        final int vIdx = y * vRowStride + x * vPixelStride;
 
-    _currentScheduleId = null;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Trip ended! Arrival logged.'), backgroundColor: Colors.green),
-    );
+        if (uIdx < uPlane.length &&
+            vIdx < vPlane.length &&
+            uvIndex + 1 < nv21.length) {
+          nv21[uvIndex] = vPlane[vIdx];
+          nv21[uvIndex + 1] = uPlane[uIdx];
+          uvIndex += 2;
+        }
+      }
+    }
+
+    return nv21;
+  }
+
+  Future<void> _logout() async {
+    await context.read<AuthService>().logout();
+    if (mounted) {
+      Navigator.of(context).pushReplacementNamed('/');
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+
     _stopDetection();
     _locationUpdateTimer?.cancel();
-    _controller?.dispose();
+    _statusUpdateTimer?.cancel();
+    _eyeClosureTimer?.cancel();
+    _alertEscalationTimer?.cancel();
+    _autoStopTimer?.cancel();
+
+    _audioPlayer.dispose();
     _faceDetector.close();
-    WidgetsBinding.instance.removeObserver(this);
+
+    if (_controller != null) {
+      _controller!.dispose();
+    }
+
+    final auth = context.read<AuthService>();
+    final monitoringService = context.read<MonitoringService>();
+    final locationService = context.read<LocationService>();
+
+    if (auth.currentUser != null && _driverId != null) {
+      monitoringService.stopMonitoring(_driverId!);
+    }
+    locationService.stopLocationTracking();
+
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    super.build(context); // For keepAlive
-    final location = Provider.of<LocationService>(context);
-    final auth = Provider.of<AuthService>(context);
+    super.build(context);
+
+    if (!_cameraInitialized || _controller == null || !_controller!.value.isInitialized) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Driver Mode'),
+          backgroundColor: Colors.blue,
+          foregroundColor: Colors.white,
+        ),
+        body: const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Initializing camera...'),
+              SizedBox(height: 8),
+              Text('Please wait while we set up your safety monitoring.'),
+            ],
+          ),
+        ),
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Driver Dashboard - Bus ${auth.currentUser?.busNumber ?? ''}'),
+        title: const Text('Driver Mode'),
+        backgroundColor: Colors.blue,
+        foregroundColor: Colors.white,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: () => Provider.of<AuthService>(context, listen: false).logout(),
+          Consumer<AuthService>(
+            builder: (context, auth, _) {
+              return PopupMenuButton<String>(
+                onSelected: (value) {
+                  if (value == 'logout') {
+                    _logout();
+                  }
+                },
+                itemBuilder: (context) => [
+                  PopupMenuItem(
+                    value: 'info',
+                    child: ListTile(
+                      leading: const Icon(Icons.info),
+                      title: Text(
+                          'Driver: ${auth.currentUser?.email ?? 'Unknown'}'),
+                      subtitle: Text(
+                          'Bus: ${auth.currentUser?.busNumber ?? 'Unknown'}'),
+                    ),
+                  ),
+                  const PopupMenuItem(
+                    value: 'logout',
+                    child: ListTile(
+                      leading: Icon(Icons.logout),
+                      title: Text('Logout'),
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
         ],
       ),
-      body: _cameraInitialized && _controller!.value.isInitialized
-          ? Column(
-              children: [
-                // Camera Preview
-                Expanded(
-                  flex: 3,
-                  child: CameraPreview(_controller!),
-                ),
-                // Status Bar
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  color: Colors.black87,
-                  child: Row(
-                    children: [
-                      if (_closedEyeFrames > 0)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: Colors.orange,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            'Eyes Closed: $_closedEyeFrames frames',
-                            style: const TextStyle(color: Colors.white),
-                          ),
-                        ),
-                      const Spacer(),
-                      if (location.currentPosition != null)
+      body: Column(
+        children: [
+          Consumer3<MonitoringService, LocationService, AuthService>(
+            builder: (context, monitoring, location, auth, _) {
+              final isOnline = monitoring.currentDriverStatus?.isOnline ?? false;
+              return Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                color: monitoring.isMonitoring && location.isTracking && isOnline
+                    ? Colors.green[100]
+                    : Colors.orange[100],
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      monitoring.isMonitoring && location.isTracking && isOnline
+                          ? Icons.security
+                          : Icons.warning,
+                      color: monitoring.isMonitoring && location.isTracking && isOnline
+                          ? Colors.green
+                          : Colors.orange,
+                    ),
+                    const SizedBox(width: 8),
+                    Column(
+                      children: [
                         Text(
-                          'Speed: ${(location.currentPosition!.speed * 3.6).toStringAsFixed(1)} km/h',
-                          style: const TextStyle(color: Colors.white, fontSize: 14),
-                        ),
-                    ],
-                  ),
-                ),
-                // Control buttons
-                Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: (!_isDetecting && !_isStreamingImages && _cameraInitialized)
-                              ? _startDetection
-                              : null,
-                          icon: const Icon(Icons.play_arrow),
-                          label: Text(_isStreamingImages
-                              ? 'Detection Active'
-                              : 'Start Detection'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _isStreamingImages ? Colors.green : Colors.blue,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
+                          monitoring.isMonitoring && location.isTracking && isOnline
+                              ? 'Monitoring Active - HQ Connected'
+                              : 'Monitoring Inactive',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: monitoring.isMonitoring && location.isTracking && isOnline
+                                ? Colors.green[700]
+                                : Colors.orange[700],
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _isStreamingImages ? _stopDetection : null,
-                          icon: const Icon(Icons.stop),
-                          label: const Text('Stop Detection'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.red,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
+                        // NEW: Alert count indicator
+                        if (_alertCount > 0)
+                          Text(
+                            'Drowsiness Alerts: $_alertCount${_alertCount >= 2 ? ' (Passengers Notified)' : ''}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: _alertCount >= 2 ? Colors.red : Colors.orange,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
-                        ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
+                  ],
                 ),
-                // Trip Controls
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _currentScheduleId != null ? _startTrip : null,
-                          icon: const Icon(Icons.play_arrow),
-                          label: const Text('Start Trip'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-                        ),
+              );
+            },
+          ),
+
+          Expanded(
+            child: Stack(
+              children: [
+                CameraPreview(_controller!),
+
+                if (_closedEyeFrames > 10)
+                  Positioned(
+                    top: 20,
+                    left: 20,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: _closedEyeFrames > 20
+                            ? Colors.red.withOpacity(0.9)
+                            : Colors.orange.withOpacity(0.9),
+                        borderRadius: BorderRadius.circular(20),
                       ),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _currentScheduleId != null ? _endTrip : null,
-                          icon: const Icon(Icons.stop),
-                          label: const Text('End Trip'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.remove_red_eye,
+                            color: Colors.white,
+                            size: 16,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Eyes Closed: $_closedEyeFrames',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
-                const SizedBox(height: 16),
+
+                // NEW: Alert indicator overlay
+                if (_alertCount > 0)
+                  Positioned(
+                    top: 20,
+                    right: 20,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: _alertCount >= 2 
+                            ? Colors.red.withOpacity(0.9)
+                            : Colors.orange.withOpacity(0.9),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Alerts: $_alertCount',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          if (_alertCount >= 2)
+                            const Text(
+                              'Passengers Notified',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
               ],
-            )
-          : const Center(child: CircularProgressIndicator()),
+            ),
+          ),
+
+          // Location and monitoring info
+          Consumer2<LocationService, MonitoringService>(
+            builder: (context, location, monitoring, _) {
+              final isOnline = monitoring.currentDriverStatus?.isOnline ?? false;
+              return Container(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        _buildInfoCard(
+                          'Location',
+                          location.currentPosition != null && location.isTracking
+                              ? 'Active'
+                              : 'Inactive',
+                          location.currentPosition != null && location.isTracking
+                              ? Icons.location_on
+                              : Icons.location_off,
+                          location.currentPosition != null && location.isTracking
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                        _buildInfoCard(
+                          'Monitoring',
+                          monitoring.isMonitoring ? 'Active' : 'Inactive',
+                          monitoring.isMonitoring
+                              ? Icons.visibility
+                              : Icons.visibility_off,
+                          monitoring.isMonitoring ? Colors.green : Colors.red,
+                        ),
+                        _buildInfoCard(
+                          'HQ Connection',
+                          isOnline ? 'Online' : 'Offline',
+                          isOnline ? Icons.cloud_done : Icons.cloud_off,
+                          isOnline ? Colors.green : Colors.red,
+                        ),
+                      ],
+                    ),
+                    if (location.currentPosition != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Speed: ${(location.currentPosition!.speed * 3.6).toStringAsFixed(1)} km/h',
+                          style:
+                              const TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ),
+                    if (location.errorMessage != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Location Error: ${location.errorMessage}',
+                          style: const TextStyle(fontSize: 10, color: Colors.red),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+
+          // Control buttons
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: (!_isDetecting && !_isStreamingImages && _cameraInitialized)
+                        ? _startDetection
+                        : null,
+                    icon: const Icon(Icons.play_arrow),
+                    label: Text(_isStreamingImages
+                        ? 'Detection Active'
+                        : 'Start Detection'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor:
+                          _isStreamingImages ? Colors.green : Colors.blue,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _isStreamingImages ? _stopDetection : null,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop Detection'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _buildInfoCard(String title, String value, IconData icon, Color color) {
+  Widget _buildInfoCard(
+      String title, String value, IconData icon, Color color) {
     return Column(
       children: [
         Icon(icon, color: color, size: 24),
         const SizedBox(height: 4),
-        Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-        Text(value, style: TextStyle(fontSize: 10, color: color)),
+        Text(
+          title,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+        ),
+        Text(
+          value,
+          style: TextStyle(fontSize: 10, color: color),
+        ),
       ],
     );
   }

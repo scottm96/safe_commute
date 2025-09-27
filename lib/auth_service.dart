@@ -16,6 +16,9 @@ class AppUser {
   final String? origin;
   final String? destination;
   final bool isActive;
+  // NEW: Add passenger name field
+  final String? passengerName;
+  final String? phoneNumber;
 
   AppUser({
     required this.id,
@@ -28,6 +31,8 @@ class AppUser {
     this.origin,
     this.destination,
     this.isActive = true,
+    this.passengerName,
+    this.phoneNumber,
   });
 
   factory AppUser.fromMap(Map<String, dynamic> map, String id) {
@@ -42,6 +47,8 @@ class AppUser {
       origin: map['origin'],
       destination: map['destination'],
       isActive: map['isActive'] ?? true,
+      passengerName: map['passengerName'],
+      phoneNumber: map['phoneNumber'],
     );
   }
 
@@ -56,6 +63,8 @@ class AppUser {
       'origin': origin,
       'destination': destination,
       'isActive': isActive,
+      'passengerName': passengerName,
+      'phoneNumber': phoneNumber,
       'lastSeen': FieldValue.serverTimestamp(),
     };
   }
@@ -98,13 +107,12 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Fixed Driver Login
+  // Fixed Driver Login (unchanged)
   Future<bool> loginDriver(String email, String password) async {
     _setLoading(true);
     _clearError();
 
     try {
-      // First check if driver exists in Firestore
       final driverQuery = await _firestore
           .collection('drivers')
           .where('email', isEqualTo: email)
@@ -125,7 +133,6 @@ class AuthService with ChangeNotifier {
         return false;
       }
 
-      // Try to sign in with Firebase Auth first
       UserCredential? userCredential;
       try {
         userCredential = await _auth.signInWithEmailAndPassword(
@@ -133,7 +140,6 @@ class AuthService with ChangeNotifier {
           password: password
         );
       } catch (authError) {
-        // If Firebase Auth account doesn't exist, create it
         if (authError is FirebaseAuthException && 
             (authError.code == 'user-not-found' || authError.code == 'invalid-credential')) {
           debugPrint('Creating Firebase Auth account for existing driver');
@@ -160,14 +166,12 @@ class AuthService with ChangeNotifier {
         return false;
       }
 
-      // Update driver session info
       await _firestore.collection('drivers').doc(driverQuery.docs.first.id).update({
         'currentSession': userCredential!.user!.uid,
         'lastLogin': FieldValue.serverTimestamp(),
         'status': 'online',
       });
 
-      // Create/update user document
       await _firestore.collection('users').doc(userCredential.user!.uid).set(
         AppUser(
           id: userCredential.user!.uid,
@@ -179,7 +183,6 @@ class AuthService with ChangeNotifier {
         SetOptions(merge: true),
       );
 
-      // Create driver status document for real-time tracking
       await _firestore.collection('driver_status').doc(userCredential.user!.uid).set({
         'driverId': userCredential.user!.uid,
         'email': email,
@@ -212,26 +215,69 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Passenger Login (Updated for Route/Bus Validation)
+  // Add this method to AuthService class
+  Future<bool> _isTicketValid(Map<String, dynamic> ticketData) async {
+    // Check if ticket has expiration time
+    if (ticketData['expiresAt'] != null) {
+      final expirationTime = ticketData['expiresAt'] as Timestamp;
+      final now = DateTime.now();
+      
+      if (now.isAfter(expirationTime.toDate())) {
+        return false; // Ticket has expired
+      }
+    }
+    
+    return true; // Ticket is still valid
+  }
+
+  // UPDATED: Enhanced Passenger Login with Name Support
   Future<bool> loginPassenger(String ticketNumber) async {
     _setLoading(true);
     _clearError();
 
     try {
+      // Search for ticket by ticket number
       final ticketQuery = await _firestore
           .collection('tickets')
           .where('ticketNumber', isEqualTo: ticketNumber)
           .where('companyId', isEqualTo: 'COMPANY_001')
-          .where('isUsed', isEqualTo: false)
           .limit(1)
           .get();
 
       if (ticketQuery.docs.isEmpty) {
-        _setError('Invalid or used ticket');
+        _setError('Invalid ticket number');
         return false;
       }
 
       final ticketData = ticketQuery.docs.first.data();
+      
+      // NEW: Check if ticket is already in use (has active session)
+      if (ticketData['currentSession'] != null) {
+        // Check if the session is still valid
+        final existingUser = await _firestore
+            .collection('users')
+            .doc(ticketData['currentSession'])
+            .get();
+            
+        if (existingUser.exists) {
+          _setError('This ticket is already in use on another device');
+          return false;
+        } else {
+          // Session is invalid, clear it
+          await _firestore.collection('tickets').doc(ticketQuery.docs.first.id).update({
+            'currentSession': null,
+          });
+        }
+      }
+
+      // NEW: Check if ticket is still valid (within 24 hours)
+      if (!await _isTicketValid(ticketData)) {
+        _setError('Ticket has expired (valid for 24 hours after booking)');
+        return false;
+      }
+
+      // NEW: Allow login even if ticket was previously used (for multiple logins)
+      // Remove the isUsed check to allow re-login with same ticket
       
       // Create anonymous account for passenger
       UserCredential userCredential;
@@ -243,17 +289,18 @@ class AuthService with ChangeNotifier {
         return false;
       }
 
-      // Mark ticket as used and link session
+      // Add this after creating the ticket data
       await _firestore.collection('tickets').doc(ticketQuery.docs.first.id).update({
-        'isUsed': true,
         'currentSession': userCredential.user!.uid,
-        'usedAt': FieldValue.serverTimestamp(),
+        'lastLogin': FieldValue.serverTimestamp(),
+        'expiresAt': FieldValue.serverTimestamp(), // Add expiration timestamp
       });
 
+      // Create user document with passenger details from ticket
       await _firestore.collection('users').doc(userCredential.user!.uid).set(
         AppUser(
           id: userCredential.user!.uid,
-          email: '${ticketNumber}@safecommute.gh',
+          email: '${ticketNumber}@safecommute.gh', // Keep for compatibility
           userType: UserType.passenger,
           ticketNumber: ticketNumber,
           busNumber: ticketData['busNumber'],
@@ -261,6 +308,9 @@ class AuthService with ChangeNotifier {
           origin: ticketData['origin'],
           destination: ticketData['destination'],
           companyId: ticketData['companyId'],
+          // NEW: Store passenger name and phone from ticket
+          passengerName: ticketData['passengerName'],
+          phoneNumber: ticketData['phoneNumber'] ?? ticketData['phone'],
         ).toMap(),
         SetOptions(merge: true),
       );
@@ -274,6 +324,9 @@ class AuthService with ChangeNotifier {
         'origin': ticketData['origin'],
         'destination': ticketData['destination'],
         'companyId': ticketData['companyId'],
+        // NEW: Include passenger name and phone
+        'passengerName': ticketData['passengerName'],
+        'phoneNumber': ticketData['phoneNumber'] ?? ticketData['phone'],
       }, userCredential.user!.uid);
       
       notifyListeners();
@@ -288,7 +341,7 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Enhanced Logout
+  // UPDATED: Enhanced Logout
   Future<void> logout() async {
     _setLoading(true);
 
@@ -300,14 +353,12 @@ class AuthService with ChangeNotifier {
           await _clearPassengerSession();
         }
 
-        // Delete user document
         try {
           await _firestore.collection('users').doc(_currentUser!.id).delete();
         } catch (e) {
           debugPrint('Error deleting user document: $e');
         }
 
-        // Remove from driver_status if exists
         if (_currentUser!.userType == UserType.driver) {
           try {
             await _firestore.collection('driver_status').doc(_currentUser!.id).delete();
@@ -383,16 +434,13 @@ class AuthService with ChangeNotifier {
   // Helper method to create driver accounts (for testing/setup)
   Future<bool> createDriverAccount(String email, String password, Map<String, dynamic> driverData) async {
     try {
-      // Create Firebase Auth account
       final userCredential = await _auth.createUserWithEmailAndPassword(
         email: email,
         password: password,
       );
 
-      // Hash password for Firestore storage
       final hashedPassword = sha256.convert(utf8.encode(password)).toString();
 
-      // Create driver document
       await _firestore.collection('drivers').add({
         ...driverData,
         'email': email,
@@ -404,12 +452,58 @@ class AuthService with ChangeNotifier {
         'status': 'offline',
       });
 
-      await _auth.signOut(); // Sign out after creation
+      await _auth.signOut();
       return true;
       
     } catch (e) {
       debugPrint('Error creating driver account: $e');
       return false;
+    }
+  }
+
+  // NEW: Method to check ticket status
+  Future<Map<String, dynamic>?> getTicketInfo(String ticketNumber) async {
+    try {
+      final ticketQuery = await _firestore
+          .collection('tickets')
+          .where('ticketNumber', isEqualTo: ticketNumber)
+          .where('companyId', isEqualTo: 'COMPANY_001')
+          .limit(1)
+          .get();
+
+      if (ticketQuery.docs.isEmpty) {
+        return null;
+      }
+
+      final ticketData = ticketQuery.docs.first.data();
+      return {
+        ...ticketData,
+        'id': ticketQuery.docs.first.id,
+      };
+    } catch (e) {
+      debugPrint('Error getting ticket info: $e');
+      return null;
+    }
+  }
+
+  
+  Future<void> markTicketAsUsed(String ticketNumber) async {
+    try {
+      final ticketQuery = await _firestore
+          .collection('tickets')
+          .where('ticketNumber', isEqualTo: ticketNumber)
+          .where('companyId', isEqualTo: 'COMPANY_001')
+          .limit(1)
+          .get();
+
+      if (ticketQuery.docs.isNotEmpty) {
+        await _firestore.collection('tickets').doc(ticketQuery.docs.first.id).update({
+          'isUsed': true,
+          'usedAt': FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) {
+      debugPrint('Error marking ticket as used: $e');
     }
   }
 }

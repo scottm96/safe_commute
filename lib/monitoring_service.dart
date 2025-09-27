@@ -5,6 +5,55 @@ import 'dart:async';
 
 enum DriverAlertLevel { none, mild, moderate, severe }
 
+// NEW: Passenger Alert class for drowsiness notifications
+class PassengerAlert {
+  final String id;
+  final String busNumber;
+  final String alertType;
+  final String severity;
+  final String message;
+  final DateTime timestamp;
+  final bool isRead;
+  final Map<String, dynamic>? metadata;
+
+  PassengerAlert({
+    required this.id,
+    required this.busNumber,
+    required this.alertType,
+    required this.severity,
+    required this.message,
+    required this.timestamp,
+    this.isRead = false,
+    this.metadata,
+  });
+
+  factory PassengerAlert.fromMap(Map<String, dynamic> map, String id) {
+    return PassengerAlert(
+      id: id,
+      busNumber: map['busNumber'] ?? '',
+      alertType: map['alertType'] ?? '',
+      severity: map['severity'] ?? 'LOW',
+      message: map['message'] ?? '',
+      timestamp: (map['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      isRead: map['isRead'] ?? false,
+      metadata: map['metadata'],
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'busNumber': busNumber,
+      'alertType': alertType,
+      'severity': severity,
+      'message': message,
+      'timestamp': FieldValue.serverTimestamp(),
+      'isRead': isRead,
+      'metadata': metadata,
+      'companyId': 'COMPANY_001',
+    };
+  }
+}
+
 class DriverStatus {
   final String driverId;
   final String busNumber;
@@ -84,10 +133,18 @@ class MonitoringService with ChangeNotifier {
   DriverStatus? _currentDriverStatus;
   StreamSubscription<QuerySnapshot>? _driversSubscription;
   StreamSubscription<QuerySnapshot>? _currentDriverSubscription;
+  StreamSubscription<QuerySnapshot>? _passengerAlertsSubscription;
   Timer? _heartbeatTimer;
   bool _isMonitoring = false;
-  String? _currentBusNumber; // For specific monitoring
+  String? _currentBusNumber;
 
+  // NEW: Passenger alerts management
+  List<PassengerAlert> _passengerAlerts = [];
+  List<PassengerAlert> get passengerAlerts => _passengerAlerts;
+  PassengerAlert? _latestDrowsinessAlert;
+  PassengerAlert? get latestDrowsinessAlert => _latestDrowsinessAlert;
+
+  bool get isMonitoring => _isMonitoring;
   DriverStatus? get currentDriverStatus => _currentDriverStatus;
 
   // Start monitoring all drivers (for passenger overview)
@@ -96,7 +153,8 @@ class MonitoringService with ChangeNotifier {
 
     _isMonitoring = true;
     _subscribeToAllDrivers();
-    _startHeartbeat(null); // General heartbeat
+    _startHeartbeat(null);
+    notifyListeners();
   }
 
   // Start monitoring specific driver by busNumber (for passenger after booking)
@@ -105,10 +163,13 @@ class MonitoringService with ChangeNotifier {
     if (_isMonitoring) {
       _unsubscribeFromCurrentDriver();
       _driversSubscription?.cancel();
+      _passengerAlertsSubscription?.cancel();
     }
     _isMonitoring = true;
     _subscribeToSpecificDriver(busNumber);
+    _subscribeToPassengerAlerts(busNumber);
     _startHeartbeat(busNumber);
+    notifyListeners();
   }
 
   void _subscribeToAllDrivers() {
@@ -117,7 +178,6 @@ class MonitoringService with ChangeNotifier {
         .where('companyId', isEqualTo: 'COMPANY_001')
         .snapshots()
         .listen((snapshot) {
-      // Update all, but set current to first active or something; for simplicity, log
       debugPrint('Updated all drivers: ${snapshot.docs.length}');
       notifyListeners();
     });
@@ -135,6 +195,37 @@ class MonitoringService with ChangeNotifier {
         _currentDriverStatus = DriverStatus.fromMap(snapshot.docs.first.data(), snapshot.docs.first.id);
       } else {
         _currentDriverStatus = null;
+      }
+      notifyListeners();
+    });
+  }
+
+  // NEW: Subscribe to passenger alerts for specific bus
+  void _subscribeToPassengerAlerts(String busNumber) {
+    _passengerAlertsSubscription = _firestore
+        .collection('passenger_alerts')
+        .where('busNumber', isEqualTo: busNumber)
+        .where('companyId', isEqualTo: 'COMPANY_001')
+        .orderBy('timestamp', descending: true)
+        .limit(10)
+        .snapshots()
+        .listen((snapshot) {
+      _passengerAlerts = snapshot.docs
+          .map((doc) => PassengerAlert.fromMap(doc.data(), doc.id))
+          .toList();
+      
+      // Update latest drowsiness alert
+      _latestDrowsinessAlert = _passengerAlerts
+          .where((alert) => alert.alertType == 'DRIVER_DROWSINESS')
+          .isNotEmpty
+          ? _passengerAlerts
+              .where((alert) => alert.alertType == 'DRIVER_DROWSINESS')
+              .first
+          : null;
+      
+      debugPrint('Updated passenger alerts: ${_passengerAlerts.length}');
+      if (_latestDrowsinessAlert != null) {
+        debugPrint('Latest drowsiness alert: ${_latestDrowsinessAlert!.message}');
       }
       notifyListeners();
     });
@@ -159,6 +250,82 @@ class MonitoringService with ChangeNotifier {
     } catch (e) {
       debugPrint('Error logging incident: $e');
     }
+  }
+
+  // NEW: Create passenger alert (called by driver when drowsiness detected)
+  Future<void> createPassengerAlert({
+    required String busNumber,
+    required String alertType,
+    required String severity,
+    required String message,
+    required DateTime timestamp,
+    Map<String, dynamic>? metadata,
+  }) async {
+    try {
+      final alert = PassengerAlert(
+        id: '',
+        busNumber: busNumber,
+        alertType: alertType,
+        severity: severity,
+        message: message,
+        timestamp: timestamp,
+        metadata: metadata,
+      );
+
+      await _firestore.collection('passenger_alerts').add(alert.toMap());
+      debugPrint('Created passenger alert: $alertType for bus $busNumber');
+    } catch (e) {
+      debugPrint('Error creating passenger alert: $e');
+    }
+  }
+
+  // NEW: Mark passenger alert as read
+  Future<void> markAlertAsRead(String alertId) async {
+    try {
+      await _firestore.collection('passenger_alerts').doc(alertId).update({
+        'isRead': true,
+        'readAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('Error marking alert as read: $e');
+    }
+  }
+
+  // NEW: Get passenger alerts for specific bus (for manual fetch)
+  Future<List<PassengerAlert>> getPassengerAlertsForBus(String busNumber) async {
+    try {
+      final query = await _firestore
+          .collection('passenger_alerts')
+          .where('busNumber', isEqualTo: busNumber)
+          .where('companyId', isEqualTo: 'COMPANY_001')
+          .orderBy('timestamp', descending: true)
+          .limit(20)
+          .get();
+
+      return query.docs
+          .map((doc) => PassengerAlert.fromMap(doc.data(), doc.id))
+          .toList();
+    } catch (e) {
+      debugPrint('Error getting passenger alerts: $e');
+      return [];
+    }
+  }
+
+  // NEW: Check if there are unread drowsiness alerts
+  bool get hasUnreadDrowsinessAlert {
+    return _passengerAlerts
+        .where((alert) => alert.alertType == 'DRIVER_DROWSINESS' && !alert.isRead)
+        .isNotEmpty;
+  }
+
+  // NEW: Get latest drowsiness alert time
+  DateTime? get latestDrowsinessAlertTime {
+    final drowsinessAlerts = _passengerAlerts
+        .where((alert) => alert.alertType == 'DRIVER_DROWSINESS')
+        .toList();
+    
+    if (drowsinessAlerts.isEmpty) return null;
+    return drowsinessAlerts.first.timestamp;
   }
 
   // Update driver status
@@ -247,9 +414,12 @@ class MonitoringService with ChangeNotifier {
     // Cancel subscriptions and timers
     _currentDriverSubscription?.cancel();
     _driversSubscription?.cancel();
+    _passengerAlertsSubscription?.cancel();
     _heartbeatTimer?.cancel();
     
     _currentDriverStatus = null;
+    _passengerAlerts.clear();
+    _latestDrowsinessAlert = null;
     notifyListeners();
   }
 
@@ -293,6 +463,7 @@ class MonitoringService with ChangeNotifier {
   void dispose() {
     _driversSubscription?.cancel();
     _currentDriverSubscription?.cancel();
+    _passengerAlertsSubscription?.cancel();
     _heartbeatTimer?.cancel();
     super.dispose();
   }

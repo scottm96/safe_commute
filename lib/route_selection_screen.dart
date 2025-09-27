@@ -102,27 +102,138 @@ class _RouteSelectionScreenState extends State<RouteSelectionScreen> {
         'destination': routeData['destination'],
         'companyId': 'COMPANY_001',
         'createdAt': FieldValue.serverTimestamp(),
+        // Add 24-hour expiration from booking time
+        'expiresAt': Timestamp.fromDate(DateTime.now().add(Duration(hours: 24))),
       });
 
       // Generate and print PDF
       final pdf = await _generateTicketPdf(ticketNumber, _nameController.text.trim(), routeData, schedule);
       await Printing.layoutPdf(onLayout: (PdfPageFormat format) async => await pdf.save());
 
-      // Auto-login
-      final auth = Provider.of<AuthService>(context, listen: false);
-      await auth.loginPassenger(ticketNumber);
-
+      // Show success message with ticket number
       if (mounted) {
-        Navigator.pushReplacementNamed(context, '/auth');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ticket booked successfully! Your ticket number is: $ticketNumber'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 4),
+          ),
+        );
+
+        // Show dialog with ticket details and instructions
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.green),
+                SizedBox(width: 8),
+                Text('Ticket Booked Successfully!'),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.green.shade200),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Your Ticket Number:',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.green.shade700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      SelectableText(
+                        ticketNumber,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Important Instructions:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                const Text('• Save your ticket number safely'),
+                const Text('• Use this number to login to the passenger app'),
+                const Text('• Your ticket is valid for 24 hours after booking'),
+                const Text('• Present your ticket to the conductor when boarding'),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade50,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.orange.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.info, color: Colors.orange.shade700, size: 16),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Ticket expires 24 hours after booking',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.orange.shade700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.of(context).pop(); // Close dialog
+                  // Navigate back to passenger login screen
+                  Navigator.pushReplacementNamed(context, '/login/passenger');
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('Login with Ticket'),
+              ),
+            ],
+          ),
+        );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Booking failed: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Booking failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
   Future<pw.Document> _generateTicketPdf(String ticketNumber, String name, Map<String, dynamic> route, Map<String, dynamic> schedule) async {
     final pdf = pw.Document();
     final departure = (schedule['departureTime'] as Timestamp).toDate();
+    final expiryTime = DateTime.now().add(Duration(hours: 24)); // Add expiry time
     final qrPainter = QrPainter(data: ticketNumber, version: QrVersions.auto, errorCorrectionLevel: QrErrorCorrectLevel.H);
     final byteData = await qrPainter.toImageData(200);
     final qrImage = byteData != null ? pw.MemoryImage(byteData.buffer.asUint8List()) : null;
@@ -146,10 +257,15 @@ class _RouteSelectionScreenState extends State<RouteSelectionScreen> {
             pw.Text('Departure: ${departure.toLocal().toString().substring(0, 16)}'),
             pw.SizedBox(height: 10),
             pw.Text('Fare: GH₵${route['fare']}'),
+            pw.SizedBox(height: 10),
+            // Add expiry information to PDF
+            pw.Text('Ticket Expires: ${expiryTime.toString().substring(0, 16)}', style: pw.TextStyle(fontSize: 12, color: const PdfColor.fromInt(0xFFFF6B00))),
             pw.SizedBox(height: 20),
             if (qrImage != null)
               pw.Container(height: 100, child: pw.Image(qrImage)),
             pw.Text('Scan QR for boarding. Valid for COMPANY_001 only.', style: pw.TextStyle(fontSize: 12, fontStyle: pw.FontStyle.italic)),
+            pw.SizedBox(height: 10),
+            pw.Text('Ticket valid for 24 hours from booking time.', style: pw.TextStyle(fontSize: 10, color: const PdfColor.fromInt(0xFF666666))),
           ],
         ),
       ),
@@ -202,15 +318,15 @@ class _RouteSelectionScreenState extends State<RouteSelectionScreen> {
   }
 
   Widget _buildSelectedRouteDisplay(Map<String, dynamic>? route) {
-  if (route == null) return const Text('Select Route');
-  
-  return Text(
-    route['name'] ?? 'Unknown Route',
-    style: const TextStyle(
-      fontWeight: FontWeight.bold,
-      fontSize: 16,
-    ),
-    overflow: TextOverflow.ellipsis,
+    if (route == null) return const Text('Select Route');
+    
+    return Text(
+      route['name'] ?? 'Unknown Route',
+      style: const TextStyle(
+        fontWeight: FontWeight.bold,
+        fontSize: 16,
+      ),
+      overflow: TextOverflow.ellipsis,
     );
   }
 
@@ -482,6 +598,22 @@ class _RouteSelectionScreenState extends State<RouteSelectionScreen> {
                     Text('Bus: ${schedule['busNumber'] ?? 'TBA'}'),
                     Text('Route: ${schedule['routeName'] ?? 'Selected Route'}'),
                     Text('Departure: ${(schedule['departureTime'] as Timestamp).toDate().toLocal().toString().substring(0, 16)}'),
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.shade100,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'Ticket valid for 24 hours after booking',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.orange,
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),

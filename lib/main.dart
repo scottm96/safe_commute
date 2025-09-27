@@ -41,7 +41,7 @@ class SafeCommuteApp extends StatelessWidget {
           '/auth': (context) => const AuthWrapper(),
           '/driver-login': (context) => const LoginScreen(userType: UserType.driver),
           '/passenger-login': (context) => const LoginScreen(userType: UserType.passenger),
-          '/route-selection': (context) => const RouteSelectionScreen(), // New route
+          '/route-selection': (context) => const RouteSelectionScreen(),
         },
         debugShowCheckedModeBanner: false,
       ),
@@ -157,10 +157,10 @@ class UserTypeSelector extends StatelessWidget {
                       height: 60,
                       child: ElevatedButton.icon(
                         onPressed: () =>
-                            Navigator.pushNamed(context, '/route-selection'), // Updated to route selection
+                            Navigator.pushNamed(context, '/passenger-login'), // FIXED: Now goes to passenger login
                         icon: const Icon(Icons.person, size: 24),
                         label: const Text(
-                          'Passenger Booking',
+                          'Passenger Access', // Updated label to match the flow
                           style: TextStyle(fontSize: 18),
                         ),
                         style: ElevatedButton.styleFrom(
