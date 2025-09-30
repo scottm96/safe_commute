@@ -110,7 +110,7 @@ class _PassengerScreenState extends State<PassengerScreen> {
       return;
     }
 
-    // Animate map to user location (implement via map controller if using flutter_map)
+    
     debugPrint('Centering map on: ${position.latitude}, ${position.longitude}');
   }
 
@@ -133,14 +133,13 @@ class _PassengerScreenState extends State<PassengerScreen> {
         'ticketNumber': auth.currentUser?.ticketNumber,
         'busNumber': auth.currentUser?.busNumber,
         'routeName': auth.currentUser?.routeName,
-        'phoneNumber': auth.currentUser?.phoneNumber, // Add phone for better identification
+        'phoneNumber': auth.currentUser?.phoneNumber, 
         'complaint': _complaintController.text.trim(),
         'status': 'pending',
         'source': 'mobile',
         'companyId': 'COMPANY_001',
         'createdAt': FieldValue.serverTimestamp(),
-        // Additional context for better complaint tracking
-        'passengerEmail': auth.currentUser?.email, // Keep the generated email for reference
+        'passengerEmail': auth.currentUser?.email, 
         'origin': auth.currentUser?.origin,
         'destination': auth.currentUser?.destination,
       });
@@ -530,7 +529,7 @@ class _PassengerScreenState extends State<PassengerScreen> {
             color: Colors.red,
             tooltip: 'Emergency',
           ),
-          // NEW: Logout button
+          // Logout button
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (String value) {

@@ -157,10 +157,10 @@ class UserTypeSelector extends StatelessWidget {
                       height: 60,
                       child: ElevatedButton.icon(
                         onPressed: () =>
-                            Navigator.pushNamed(context, '/passenger-login'), // FIXED: Now goes to passenger login
+                            Navigator.pushNamed(context, '/passenger-login'), 
                         icon: const Icon(Icons.person, size: 24),
                         label: const Text(
-                          'Passenger Access', // Updated label to match the flow
+                          'Passenger Access',
                           style: TextStyle(fontSize: 18),
                         ),
                         style: ElevatedButton.styleFrom(

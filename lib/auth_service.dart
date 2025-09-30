@@ -16,7 +16,6 @@ class AppUser {
   final String? origin;
   final String? destination;
   final bool isActive;
-  // NEW: Add passenger name field
   final String? passengerName;
   final String? phoneNumber;
 
@@ -107,7 +106,7 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  // Fixed Driver Login (unchanged)
+  // Fixed Driver Login
   Future<bool> loginDriver(String email, String password) async {
     _setLoading(true);
     _clearError();
@@ -276,8 +275,7 @@ class AuthService with ChangeNotifier {
         return false;
       }
 
-      // NEW: Allow login even if ticket was previously used (for multiple logins)
-      // Remove the isUsed check to allow re-login with same ticket
+
       
       // Create anonymous account for passenger
       UserCredential userCredential;
